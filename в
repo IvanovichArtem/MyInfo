@@ -34,6 +34,10 @@ class BaselineNN(torch.nn.Module):
         tensor_2d_num, _ = tensor_2d
         numerical_1d, _ = one_dim_data
 
+        # Если 3D данные — это PackedSequence, распакуем их
+        if isinstance(flatten_3d_num, torch.nn.utils.rnn.PackedSequence):
+            flatten_3d_num, _ = torch.nn.utils.rnn.pad_packed_sequence(flatten_3d_num, batch_first=True)
+
         # Объединяем все данные в один вектор
         combined_data = torch.cat(
             (flatten_3d_num, tensor_2d_num, numerical_1d), 

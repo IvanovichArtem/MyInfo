@@ -1,59 +1,94 @@
 import torch
+import torch.nn as nn
 
-class BaselineNN(torch.nn.Module):
-    def __init__(self, feats_4_model, emb_shapes, drop=0.3):
+class BaselineNN(nn.Module):
+    def __init__(self, feats_4_model, emb_shapes, lstm_sizes, drop=0.3):
         super().__init__()
 
-        # Собираем размерность данных для линейного слоя
-        c_tens_id_3d = "TENSOR_3D"
-        eq_3D_num_feats = feats_4_model[c_tens_id_3d]["numerical"]
+        self.lstm_sizes = lstm_sizes
 
-        c_tens_id_2d = "TENSOR_2D"
-        c_num_feats_2d = feats_4_model[c_tens_id_2d]["numerical"]
+        # Инициализация выходных размеров для эмбеддингов
+        embedding_output_size = {key: sum(v[-1] for v in emb_shapes[key]) for key in emb_shapes}
 
+        #### 3D
+        c_tens_id = "TENSOR_3D"
+        eq_3D_num_feats = feats_4_model[c_tens_id]["numerical"]
+        c_input_size = embedding_output_size[c_tens_id] + len(eq_3D_num_feats)
+
+        self.eq_3d_lstm = LstmLayer(c_input_size, **lstm_sizes[TENSOR_IDS["EQ_3D"]])
+        self.eq_3d_bn = PackedSequenceBatchNorm1d(len(eq_3D_num_feats))
+        self.eq_3d_emb = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
+
+        #### 2D
+        c_tens_id = "TENSOR_2D"
+        c_num_feats = feats_4_model[c_tens_id]["numerical"]
+        
+        # Входные данные для 2D теперь не используют LSTM
+        self.eq_2d_bn = PackedSequenceBatchNorm1d(len(c_num_feats))
+        self.eq_2d_emb = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
+
+        #### 1D
         eq_1D_num_feats = feats_4_model["TENSOR_1D"]["numerical"]
         sum_req_num_feats = feats_4_model["headers"]
 
-        # Размер входных данных для линейного слоя
-        total_input_size = (
-            len(eq_3D_num_feats) + 
-            len(c_num_feats_2d) + 
-            len(eq_1D_num_feats) + 
-            len(sum_req_num_feats)
+        # Вычисляем размер входа для линейного слоя
+        linear1_input_size = (
+            len(eq_1D_num_feats) + len(sum_req_num_feats) + embedding_output_size['ONE_DIM']
         )
 
-        # Упрощённый линейный слой
-        self.fc = torch.nn.Sequential(
-            torch.nn.Dropout(drop),
-            torch.nn.Linear(total_input_size, 1)
+        self.fc_branch = nn.Sequential(
+            nn.Dropout(drop),
+            nn.Linear(linear1_input_size, 1)
         )
 
-    def forward(self, one_dim_data, tensor_2d, tensor_3d):
-        # Вытаскиваем числовые данные из входов
-        flatten_3d_num, _, _ = tensor_3d
-        tensor_2d_num, _ = tensor_2d
-        numerical_1d, _ = one_dim_data
+        self.bn1 = nn.BatchNorm1d(len(eq_1D_num_feats) + len(sum_req_num_feats))
+        self.emb1 = EmbedingLayer(emb_shapes['ONE_DIM'])
 
-        # Если 3D данные — это PackedSequence, распакуем их
-        if isinstance(flatten_3d_num, torch.nn.utils.rnn.PackedSequence):
-            flatten_3d_num, _ = torch.nn.utils.rnn.pad_packed_sequence(flatten_3d_num, batch_first=True)
+    def forward_3d(self, tensor_3d):
+        flatten_3d_num, flatten_3d_emb, emb_3d_lens = tensor_3d
+        flatten_3d_num = self.eq_3d_bn(flatten_3d_num)
 
-        # Объединяем все данные в один вектор
-        combined_data = torch.cat(
-            (flatten_3d_num, tensor_2d_num, numerical_1d), 
-            axis=-1
-        )
+        lstm_out = self.eq_3d_lstm(flatten_3d_num)
 
-        # Прогоняем через линейный слой и получаем логиты
-        logits = self.fc(combined_data)
+        out = torch.split(lstm_out, emb_3d_lens)
+        out = torch.nn.utils.rnn.pack_sequence(out, enforce_sorted=False)
+        return out
+
+    def forward_2d(self, tensor_2d):
+        tensor_2d_num, tensor_2d_emb = tensor_2d
+
+        num = self.eq_2d_bn(tensor_2d_num)
+        emb = self.eq_2d_emb(tensor_2d_emb)
+
+        # Конкатенация 2D данных (без LSTM)
+        data = torch.cat([num, emb], dim=-1)
+        return data
+
+    def forward_1d(self, one_dim_data, eq_branch_out):
+        numerical_1d, embedings_1d = one_dim_data
+        numerical_1d = self.bn1(numerical_1d)
+        embedings_1d = self.emb1(embedings_1d)
+
+        # Конкатенация 1D данных с выходом 2D
+        fc_input = torch.cat((numerical_1d, embedings_1d, eq_branch_out), dim=-1)
+        logits = self.fc_branch(fc_input)
 
         return logits
-
+    
     @staticmethod
     def preproc_input(ONE_DIM, TENSOR_2D, TENSOR_3D):
         return ONE_DIM, TENSOR_2D, TENSOR_3D
     
     def forward(self, **kwargs):
         tensor_1d, tensor_2d, tensor_3d = self.preproc_input(**kwargs)
-        logits = self.forward(tensor_1d, tensor_2d, tensor_3d)
+
+        # Обработка 3D тензора
+        data_3d_out = self.forward_3d(tensor_3d)
+
+        # Обработка 2D тензора
+        data_2d_out = self.forward_2d(tensor_2d)
+
+        # Обработка 1D тензора
+        logits = self.forward_1d(tensor_1d, data_2d_out)
+
         return logits

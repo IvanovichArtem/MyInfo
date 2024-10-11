@@ -1,113 +1,55 @@
-class NN(torch.Module):
-    def __init__(self, feats_4_model, emb_shapes, lstm_sizes, drop=0.3):
+import torch
+
+class BaselineNN(torch.nn.Module):
+    def __init__(self, feats_4_model, emb_shapes, drop=0.3):
         super().__init__()
 
-        self.lstm_sizes = lstm_sizes
+        # Собираем размерность данных для линейного слоя
+        c_tens_id_3d = "TENSOR_3D"
+        eq_3D_num_feats = feats_4_model[c_tens_id_3d]["numerical"]
 
-        embeding_output_size = {}
-        for key in emb_shapes.keys():
-            embeding_output_size[key] = sum(v[-1] for v in emb_shapes[key])
+        c_tens_id_2d = "TENSOR_2D"
+        c_num_feats_2d = feats_4_model[c_tens_id_2d]["numerical"]
 
-        #### 3D
-        c_tens_id = "TENSOR_3D"
-        eq_3D_num_feats = feats_4_model[c_tens_id]["numerical"]
-        c_input_size = embeding_output_size[c_tens_id] + len(eq_3D_num_feats)
-
-        self.eq_3d_lstm1 = LstmLayer(c_input_size, **lstm_sizes[TENSOR_IDS["EQ_3D"]])
-        self.eq_3d_bn1 = PackedSequenceBatchNorm1d(len(eq_3D_num_feats))
-        self.eq_3d_emb1 = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
-
-        self.eq_3d_lstm2 = LstmLayer(lstm_sizes[TENSOR_IDS["EQ_3D"]]['hidden_state'], **lstm_sizes[TENSOR_IDS["EQ_3D"]])
-        self.eq_3d_bn2 = PackedSequenceBatchNorm1d(lstm_sizes[TENSOR_IDS["EQ_3D"]]['hidden_state'])
-        self.eq_3d_emb2 = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
-        ########
-
-        ##### 2D
-        c_tens_id = "TENSOR_2D"
-        c_num_feats = feats_4_model[c_tens_id]["numerical"]
-        c_input_size = (
-            embeding_output_size[c_tens_id]
-            + len(c_num_feats)
-            + lstm_sizes[TENSOR_IDS["EQ_3D"]]["hidden_state"]
-        )
-
-        self.eq_2d_lstm1 = LstmLayer(c_input_size, **lstm_sizes[TENSOR_IDS["EQ_2D"]])
-        self.eq_2d_bn1 = PackedSequenceBatchNorm1d(len(c_num_feats))
-        self.eq_2d_emb1 = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
-
-        self.eq_2d_lstm2 = LstmLayer(lstm_sizes[TENSOR_IDS["EQ_2D"]]['hidden_state'], **lstm_sizes[TENSOR_IDS["EQ_2D"]])
-        self.eq_2d_bn2 = PackedSequenceBatchNorm1d(lstm_sizes[TENSOR_IDS["EQ_2D"]]['hidden_state'])
-        self.eq_2d_emb2 = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
-        #####
-
-        #### 1D
         eq_1D_num_feats = feats_4_model["TENSOR_1D"]["numerical"]
         sum_req_num_feats = feats_4_model["headers"]
 
-        concated_numerical_1d_data_size = len(eq_1D_num_feats) + len(sum_req_num_feats)
-        linear1_input_size = concated_numerical_1d_data_size + embeding_output_size['ONE_DIM']
-        linear1_input_size += lstm_sizes[TENSOR_IDS['EQ_2D']]['hidden_state']
-
-        self.fc_branch1 = torch.nn.Sequential(
-            torch.nn.Dropout(drop),
-            torch.nn.Linear(linear1_input_size, lstm_sizes[TENSOR_IDS['EQ_2D']]['hidden_state'])
+        # Размер входных данных для линейного слоя
+        total_input_size = (
+            len(eq_3D_num_feats) + 
+            len(c_num_feats_2d) + 
+            len(eq_1D_num_feats) + 
+            len(sum_req_num_feats)
         )
 
-        self.fc_branch2 = torch.nn.Sequential(
+        # Упрощённый линейный слой
+        self.fc = torch.nn.Sequential(
             torch.nn.Dropout(drop),
-            torch.nn.Linear(lstm_sizes[TENSOR_IDS['EQ_2D']]['hidden_state'], 1)
+            torch.nn.Linear(total_input_size, 1)
         )
 
-        self.bn1 = torch.nn.BatchNorm1d(concated_numerical_1d_data_size)
-        self.emb1 = EmbedingLayer(emb_shapes['ONE_DIM'])
-        ########
+    def forward(self, one_dim_data, tensor_2d, tensor_3d):
+        # Вытаскиваем числовые данные из входов
+        flatten_3d_num, _, _ = tensor_3d
+        tensor_2d_num, _ = tensor_2d
+        numerical_1d, _ = one_dim_data
 
-    def forward_3d(self, tensor_3d):
-        flatten_3d_num, flatten_3d_emb, emb_3d_lens = tensor_3d
-        flatten_3d_num = self.eq_3d_bn1(flatten_3d_num)
-        lstm_out1 = self.eq_3d_lstm1(flatten_3d_num)
-        
-        lstm_out1 = self.eq_3d_bn2(lstm_out1)
-        lstm_out2 = self.eq_3d_lstm2(lstm_out1)
+        # Объединяем все данные в один вектор
+        combined_data = torch.cat(
+            (flatten_3d_num, tensor_2d_num, numerical_1d), 
+            axis=-1
+        )
 
-        out = torch.split(lstm_out2, emb_3d_lens)
-        out = torch.nn.utils.rnn.pack_sequence(out, enforce_sorted=False)
-        return out
-
-    def forward_2d(self, tensor_2d, tensor_3d_lstm_out):
-        tensor_2d_num, tensor_2d_emb = tensor_2d
-
-        num = self.eq_2d_bn1(tensor_2d_num)
-        emb = self.eq_2d_emb1(tensor_2d_emb)
-        data = cat_packed_seq([num, emb, tensor_3d_lstm_out])
-
-        lstm_out1 = self.eq_2d_lstm1(data)
-
-        lstm_out1 = self.eq_2d_bn2(lstm_out1)
-        lstm_out2 = self.eq_2d_lstm2(lstm_out1)
-
-        return lstm_out2
-
-    def forward_1d(self, one_dim_data, eq_branch_out):
-        numerical_1d, embedings_1d = one_dim_data
-        numerical_1d = self.bn1(numerical_1d)
-        embedings_1d = self.emb1(embedings_1d)
-        fc = torch.cat((numerical_1d, embedings_1d, eq_branch_out), axis=-1)
-
-        fc1 = self.fc_branch1(fc)
-        logits = self.fc_branch2(fc1)
+        # Прогоняем через линейный слой и получаем логиты
+        logits = self.fc(combined_data)
 
         return logits
-    
+
     @staticmethod
     def preproc_input(ONE_DIM, TENSOR_2D, TENSOR_3D):
         return ONE_DIM, TENSOR_2D, TENSOR_3D
     
     def forward(self, **kwargs):
         tensor_1d, tensor_2d, tensor_3d = self.preproc_input(**kwargs)
-
-        data_3d_out = self.forward_3d(tensor_3d)
-        data_2d_out = self.forward_2d(tensor_2d, data_3d_out)
-        logits = self.forward_1d(tensor_1d, data_2d_out)
-
+        logits = self.forward(tensor_1d, tensor_2d, tensor_3d)
         return logits

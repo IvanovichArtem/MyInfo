@@ -1,94 +1,82 @@
-import torch
-import torch.nn as nn
+class MAPEEarlyStoppingCallback(IEpochMetricHandlerCallback):
+    """Early stopping based on relative difference between train and validation loss.
 
-class BaselineNN(nn.Module):
-    def __init__(self, feats_4_model, emb_shapes, lstm_sizes, drop=0.3):
-        super().__init__()
+    Args:
+        patience (int): Number of epochs with no improvement after which training will be stopped.
+        loader_key_1 (str): Loader key for the first loader (e.g. "train").
+        loader_key_2 (str): Loader key for the second loader (e.g. "valid").
+        metric_key (str): Metric key for the losses to compare (default is "loss").
+        min_delta (float): Minimum change in the monitored metric to qualify as an improvement.
+        relative_threshold (float): Threshold for relative difference to detect overfitting.
+    """
 
-        self.lstm_sizes = lstm_sizes
+    def __init__(self, patience=5, loader_key_1="train", loader_key_2="valid", metric_key="loss", min_delta = 1e-6, relative_threshold=0.1):
+        super().__init__(loader_key=loader_key_2, metric_key=metric_key, minimize=True, min_delta=min_delta)
+        self.patience = patience
+        self.loader_key_1 = loader_key_1
+        self.loader_key_2 = loader_key_2
+        self.min_delta = min_delta
+        self.relative_threshold = relative_threshold
+        self.counter = 0
+        self.best_val_loss = None
+        self.best_train_loss = None
+        self.early_stop = False
 
-        # Инициализация выходных размеров для эмбеддингов
-        embedding_output_size = {key: sum(v[-1] for v in emb_shapes[key]) for key in emb_shapes}
+        # Хранение потерь для каждого лоадера
+        self.losses_1 = []
+        self.losses_2 = []
 
-        #### 3D
-        c_tens_id = "TENSOR_3D"
-        eq_3D_num_feats = feats_4_model[c_tens_id]["numerical"]
-        c_input_size = embedding_output_size[c_tens_id] + len(eq_3D_num_feats)
+    def on_loader_end(self, runner):
+        """Собираем значения loss из обоих лоадеров."""
+        current_loader = runner.loader_key
+        current_loss = runner.loader_metrics[self.metric_key]
 
-        self.eq_3d_lstm = LstmLayer(c_input_size, **lstm_sizes[TENSOR_IDS["EQ_3D"]])
-        self.eq_3d_bn = PackedSequenceBatchNorm1d(len(eq_3D_num_feats))
-        self.eq_3d_emb = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
+        # Сохраняем loss для каждого лоадера
+        if current_loader == self.loader_key_1:
+            self.losses_1.append(current_loss)
+        elif current_loader == self.loader_key_2:
+            self.losses_2.append(current_loss)
 
-        #### 2D
-        c_tens_id = "TENSOR_2D"
-        c_num_feats = feats_4_model[c_tens_id]["numerical"]
-        
-        # Входные данные для 2D теперь не используют LSTM
-        self.eq_2d_bn = PackedSequenceBatchNorm1d(len(c_num_feats))
-        self.eq_2d_emb = PackedSequenceEmbedingLayer(emb_shapes[c_tens_id])
+    def on_epoch_end(self, runner):
+        """Вычисляем относительную разницу и проверяем на улучшение."""
+        if len(self.losses_1) > 0 and len(self.losses_2) > 0:
+            train_loss = self.losses_1[-1]
+            val_loss = self.losses_2[-1]
+            if self.best_val_loss is None:
+                # Инициализация лучших потерь
+                self.best_val_loss = val_loss
+                self.best_train_loss = train_loss
+            else:
+                # Вычисляем относительную разницу
+                epsilon = 1e-8  # Маленькое значение для избежания деления на ноль
+                relative_difference = abs(train_loss - val_loss) / (train_loss + epsilon)
 
-        #### 1D
-        eq_1D_num_feats = feats_4_model["TENSOR_1D"]["numerical"]
-        sum_req_num_feats = feats_4_model["headers"]
+                # Проверка на улучшение и переобучение
+                if train_loss < self.best_train_loss - self.min_delta and val_loss > self.best_val_loss + self.min_delta:
+                    if relative_difference > self.relative_threshold:
+                        self.counter += 1
+                        print(f"Relative difference: {relative_difference} (counter: {self.counter})")
+                        if self.counter >= self.patience:
+                            runner.need_early_stop = True
+                            print(f"Остановка обучения на эпохе {runner.epoch}.")
+                            self.early_stop = True
+                else:
+                    # Если есть улучшение
+                    self.best_val_loss = val_loss
+                    self.best_train_loss = train_loss
+                    self.counter = 0
+                    print(f"Улучшение метрики: train_loss={train_loss}, val_loss={val_loss} {relative_difference}")
 
-        # Вычисляем размер входа для линейного слоя
-        linear1_input_size = (
-            len(eq_1D_num_feats) + len(sum_req_num_feats) + embedding_output_size['ONE_DIM']
-        )
+            # Очищаем списки потерь для следующей эпохи
+            self.losses_1.clear()
+            self.losses_2.clear()
 
-        self.fc_branch = nn.Sequential(
-            nn.Dropout(drop),
-            nn.Linear(linear1_input_size, 1)
-        )
+    def handle_score_is_better(self, runner):
+        """Обработка случая, когда метрика улучшилась."""
+        self.counter = 0  # Сброс счётчика плохих эпох
+        print("Обработка: метрика улучшилась.")
 
-        self.bn1 = nn.BatchNorm1d(len(eq_1D_num_feats) + len(sum_req_num_feats))
-        self.emb1 = EmbedingLayer(emb_shapes['ONE_DIM'])
-
-    def forward_3d(self, tensor_3d):
-        flatten_3d_num, flatten_3d_emb, emb_3d_lens = tensor_3d
-        flatten_3d_num = self.eq_3d_bn(flatten_3d_num)
-
-        lstm_out = self.eq_3d_lstm(flatten_3d_num)
-
-        out = torch.split(lstm_out, emb_3d_lens)
-        out = torch.nn.utils.rnn.pack_sequence(out, enforce_sorted=False)
-        return out
-
-    def forward_2d(self, tensor_2d):
-        tensor_2d_num, tensor_2d_emb = tensor_2d
-
-        num = self.eq_2d_bn(tensor_2d_num)
-        emb = self.eq_2d_emb(tensor_2d_emb)
-
-        # Конкатенация 2D данных (без LSTM)
-        data = torch.cat([num, emb], dim=-1)
-        return data
-
-    def forward_1d(self, one_dim_data, eq_branch_out):
-        numerical_1d, embedings_1d = one_dim_data
-        numerical_1d = self.bn1(numerical_1d)
-        embedings_1d = self.emb1(embedings_1d)
-
-        # Конкатенация 1D данных с выходом 2D
-        fc_input = torch.cat((numerical_1d, embedings_1d, eq_branch_out), dim=-1)
-        logits = self.fc_branch(fc_input)
-
-        return logits
-    
-    @staticmethod
-    def preproc_input(ONE_DIM, TENSOR_2D, TENSOR_3D):
-        return ONE_DIM, TENSOR_2D, TENSOR_3D
-    
-    def forward(self, **kwargs):
-        tensor_1d, tensor_2d, tensor_3d = self.preproc_input(**kwargs)
-
-        # Обработка 3D тензора
-        data_3d_out = self.forward_3d(tensor_3d)
-
-        # Обработка 2D тензора
-        data_2d_out = self.forward_2d(tensor_2d)
-
-        # Обработка 1D тензора
-        logits = self.forward_1d(tensor_1d, data_2d_out)
-
-        return logits
+    def handle_score_is_not_better(self, runner):
+        """Обработка случая, когда метрика не улучшилась."""
+        self.counter += 1  # Увеличиваем счётчик плохих эпох
+        print(f"Обработка: метрика не улучшилась, counter = {self.counter}.")

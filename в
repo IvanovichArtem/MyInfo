@@ -1,82 +1,22 @@
-class MAPEEarlyStoppingCallback(IEpochMetricHandlerCallback):
-    """Early stopping based on relative difference between train and validation loss.
+import importlib
+import inspect
 
-    Args:
-        patience (int): Number of epochs with no improvement after which training will be stopped.
-        loader_key_1 (str): Loader key for the first loader (e.g. "train").
-        loader_key_2 (str): Loader key for the second loader (e.g. "valid").
-        metric_key (str): Metric key for the losses to compare (default is "loss").
-        min_delta (float): Minimum change in the monitored metric to qualify as an improvement.
-        relative_threshold (float): Threshold for relative difference to detect overfitting.
-    """
+# Попробуем загрузить модуль
+module_name = 'имя_модуля_или_библиотеки'
+module = importlib.import_module(module_name)
 
-    def __init__(self, patience=5, loader_key_1="train", loader_key_2="valid", metric_key="loss", min_delta = 1e-6, relative_threshold=0.1):
-        super().__init__(loader_key=loader_key_2, metric_key=metric_key, minimize=True, min_delta=min_delta)
-        self.patience = patience
-        self.loader_key_1 = loader_key_1
-        self.loader_key_2 = loader_key_2
-        self.min_delta = min_delta
-        self.relative_threshold = relative_threshold
-        self.counter = 0
-        self.best_val_loss = None
-        self.best_train_loss = None
-        self.early_stop = False
+# Теперь ищем класс в этом модуле
+class_name = 'ИмяКласса'
+found_class = None
 
-        # Хранение потерь для каждого лоадера
-        self.losses_1 = []
-        self.losses_2 = []
+# Ищем во всех атрибутах модуля
+for name, obj in inspect.getmembers(module):
+    if name == class_name and inspect.isclass(obj):
+        found_class = obj
+        break
 
-    def on_loader_end(self, runner):
-        """Собираем значения loss из обоих лоадеров."""
-        current_loader = runner.loader_key
-        current_loss = runner.loader_metrics[self.metric_key]
-
-        # Сохраняем loss для каждого лоадера
-        if current_loader == self.loader_key_1:
-            self.losses_1.append(current_loss)
-        elif current_loader == self.loader_key_2:
-            self.losses_2.append(current_loss)
-
-    def on_epoch_end(self, runner):
-        """Вычисляем относительную разницу и проверяем на улучшение."""
-        if len(self.losses_1) > 0 and len(self.losses_2) > 0:
-            train_loss = self.losses_1[-1]
-            val_loss = self.losses_2[-1]
-            if self.best_val_loss is None:
-                # Инициализация лучших потерь
-                self.best_val_loss = val_loss
-                self.best_train_loss = train_loss
-            else:
-                # Вычисляем относительную разницу
-                epsilon = 1e-8  # Маленькое значение для избежания деления на ноль
-                relative_difference = abs(train_loss - val_loss) / (train_loss + epsilon)
-
-                # Проверка на улучшение и переобучение
-                if train_loss < self.best_train_loss - self.min_delta and val_loss > self.best_val_loss + self.min_delta:
-                    if relative_difference > self.relative_threshold:
-                        self.counter += 1
-                        print(f"Relative difference: {relative_difference} (counter: {self.counter})")
-                        if self.counter >= self.patience:
-                            runner.need_early_stop = True
-                            print(f"Остановка обучения на эпохе {runner.epoch}.")
-                            self.early_stop = True
-                else:
-                    # Если есть улучшение
-                    self.best_val_loss = val_loss
-                    self.best_train_loss = train_loss
-                    self.counter = 0
-                    print(f"Улучшение метрики: train_loss={train_loss}, val_loss={val_loss} {relative_difference}")
-
-            # Очищаем списки потерь для следующей эпохи
-            self.losses_1.clear()
-            self.losses_2.clear()
-
-    def handle_score_is_better(self, runner):
-        """Обработка случая, когда метрика улучшилась."""
-        self.counter = 0  # Сброс счётчика плохих эпох
-        print("Обработка: метрика улучшилась.")
-
-    def handle_score_is_not_better(self, runner):
-        """Обработка случая, когда метрика не улучшилась."""
-        self.counter += 1  # Увеличиваем счётчик плохих эпох
-        print(f"Обработка: метрика не улучшилась, counter = {self.counter}.")
+if found_class:
+    # Если нашли класс, покажем его исходный файл
+    print(f"Класс найден в файле: {inspect.getfile(found_class)}")
+else:
+    print("Класс не найден.")

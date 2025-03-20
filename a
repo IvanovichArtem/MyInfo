@@ -1,28 +1,55 @@
-updated_df = df.copy()
+def predict_and_evaluate(df, id_col, dt_col, col, migration_matrix):
+    """
+    Предсказывает 'next_<col>' для всего датафрейма и оценивает предсказания.
 
-# Определяем уникальные id и создаём словарь для хранения диапазонов дат
-unique_ids = df['id'].unique()
-date_ranges = {id: pd.date_range(df.loc[df['id'] == id, 'dt'].min(), 
-                                 df.loc[df['id'] == id, 'dt'].max(), 
-                                 freq='MS') 
-               for id in unique_ids}
+    df: DataFrame с колонками [id_col, dt_col, col]
+    migration_matrix: DataFrame, где строки - текущее состояние, столбцы - следующее состояние
 
-# Создаём DataFrame с индивидуальными диапазонами дат
-full_df = pd.concat([pd.DataFrame({'id': id, 'dt': dates}) for id, dates in date_ranges.items()], ignore_index=True)
+    Возвращает DataFrame с добавленным столбцом 'predicted_next_<col>' и выводит метрики качества.
+    """
+    df = df.copy()
+    df = df.sort_values([id_col, dt_col]).reset_index(drop=True)
+    
+    latest_gr = dict(zip(df[id_col], df[col]))
+    predicted_values = []
+    
+    for index, row in df.iterrows():
+        current_id = row[id_col]
+        current_state = latest_gr.get(current_id, row[col])
 
-# Объединяем с оригинальным DataFrame
-merged_df = full_df.merge(df, on=['id', 'dt'], how='left')
+        if current_state in migration_matrix.index:
+            next_state = migration_matrix.loc[current_state].idxmax()
+        else:
+            next_state = current_state  # Оставляем то же состояние, если неизвестно
 
-# Заполняем пропущенные значения нулями для финансовых столбцов
-for col in ['Задолженность', 'Резерв', 'Выдано', 'Сумма миграции']:
-    merged_df[col] = merged_df[col].fillna(0)
+        latest_gr[current_id] = next_state
+        predicted_values.append(next_state)
+    
+    df[f"predicted_next_{col}"] = predicted_values
+    
+    # Оценка качества предсказаний
+    target = df[col].shift(-1).dropna()
+    predict = df[f"predicted_next_{col}"].iloc[:-1]
+    
+    accuracy = accuracy_score(target, predict)
+    print(f"Accuracy: {accuracy:.4f}")
 
-# Заполняем столбцы CY, bucket_NPL и RG шифтом предыдущего значения
-for col in ['CY', 'bucket_NPL', 'RG']:
-    merged_df[col] = merged_df.groupby('id')[col].fillna(method='ffill')
+    labels = sorted(df[col].dropna().unique())
+    conf_mat = confusion_matrix(target, predict, labels=labels)
+    conf_df = pd.DataFrame(conf_mat, index=labels, columns=labels)
+    
+    print("\nConfusion Matrix:")
+    print(conf_df)
 
-# Рассчитываем "Погашено" на основе предыдущей задолженности
-merged_df['Погашено'] = merged_df.groupby('id')['Задолженность'].shift(1).fillna(0)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_df, annot=True, fmt="d", cmap="Blues", linewidths=0.5)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title("Confusion Matrix")
+    plt.show()
 
-# Финальный результат
-updated_df = merged_df
+    class_report = classification_report(target, predict, labels=labels)
+    print("\nClassification Report:")
+    print(class_report)
+    
+    return df

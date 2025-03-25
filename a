@@ -164,3 +164,19 @@ def optimize_alpha_per_row_grid_search(original_matrix, r, df, id_col, dt_col, c
     
     final_matrix = adjusted_matrix(optimized_alpha, original_matrix, r)
     return optimized_alpha, final_matrix, losses
+
+
+# === GRID SEARCH ДЛЯ ОДНОЙ СТРОКИ ===
+def grid_search_for_row(row_index, current_alpha, original_matrix, r, df, id_col, dt_col, col, state_names, grid_values):
+    best_loss = np.inf
+    best_alpha_row = None
+    n = original_matrix.shape[1]
+    
+    # Перебираем все комбинации для текущей строки
+    for candidate in product(grid_values, repeat=n):
+        candidate = np.array(candidate)
+        loss = loss_function_row(candidate, row_index, current_alpha, original_matrix, r, df, id_col, dt_col, col, state_names)
+        if loss < best_loss:
+            best_loss = loss
+            best_alpha_row = candidate.copy()
+    return best_alpha_row, best_loss

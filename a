@@ -145,3 +145,22 @@ def optimize_alpha_per_row(original_matrix, r, df, id_col, dt_col, col):
 
 # Оптимизация по строкам:
 # optimized_alpha, final_matrix = optimize_alpha_per_row(original_matrix, r, df, 'id', 'date', 'status')
+
+
+def optimize_alpha_per_row_grid_search(original_matrix, r, df, id_col, dt_col, col, grid_values):
+    """
+    Оптимизирует коэффициенты α для каждой строки (статуса) отдельно с использованием grid search.
+    grid_values – массив значений, которые мы перебираем для каждого элемента.
+    """
+    state_names = list(original_matrix.index)
+    optimized_alpha = np.zeros_like(original_matrix)
+    losses = []
+    
+    for i in range(original_matrix.shape[0]):
+        best_alpha_row, best_loss = grid_search_for_row(i, optimized_alpha, original_matrix, r, df, id_col, dt_col, col, state_names, grid_values)
+        optimized_alpha[i, :] = best_alpha_row
+        losses.append(best_loss)
+        print(f"Статус {state_names[i]}: лучшая alpha = {best_alpha_row}, loss = {best_loss}")
+    
+    final_matrix = adjusted_matrix(optimized_alpha, original_matrix, r)
+    return optimized_alpha, final_matrix, losses

@@ -1,3 +1,28 @@
+def adjust_migration_matrix(migration_matrix, r):
+    """
+    Корректирует матрицу миграции в зависимости от коэффициента R_t.
+    :param migration_matrix: np.array, базовая матрица переходов
+    :param r: float, коэффициент изменения (R_t)
+    :return: скорректированная матрица np.array
+    """
+    adjusted_matrix = migration_matrix.copy()
+    num_states = migration_matrix.shape[0]
+    
+    for i in range(num_states):
+        for j in range(num_states):
+            if j < i:  # Понижение рейтинга
+                adjusted_matrix[i, j] *= r
+            elif j > i:  # Повышение рейтинга
+                adjusted_matrix[i, j] /= r
+    
+    # Нормализация строк до 1
+    adjusted_matrix /= adjusted_matrix.sum(axis=1, keepdims=True)
+    
+    return adjusted_matrix
+
+
+
+
 def simulate_total_loss(portfolio_df, migration_matrix, default_label='D'):
     """
     Симулирует кредитные переходы для каждого кредита по времени и возвращает общий агрегированный loss.
@@ -180,3 +205,9 @@ def grid_search_for_row(row_index, current_alpha, original_matrix, r, df, id_col
             best_loss = loss
             best_alpha_row = candidate.copy()
     return best_alpha_row, best_loss
+
+
+
+
+
+

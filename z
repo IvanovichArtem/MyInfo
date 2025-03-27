@@ -1,0 +1,39 @@
+def log_likelihood_weighted(P, S):
+    return np.sum(S * np.log(P + 1e-9))
+
+def kl_divergence_weighted(P, Q, S):
+    return np.sum(S * (np.log(Q + 1e-9) - np.log(P + 1e-9)))
+
+def mse_weighted(P, Q, S):
+    return np.sum(S * (P - Q) ** 2) / np.sum(S)
+
+def hellinger_distance_weighted(P, Q, S):
+    return np.sqrt(np.sum(S * (np.sqrt(P) - np.sqrt(Q)) ** 2)) / np.sqrt(2)
+
+def compare_matrices(migration_matrix, final_matrix, F_test, S_test):
+    metrics = {}
+
+    for name, P in [("Migration Matrix", migration_matrix), ("Final Matrix", final_matrix)]:
+        ll = log_likelihood_weighted(P, S_test)
+        kl = kl_divergence_weighted(P, F_test, S_test)
+        mse = mse_weighted(P, F_test, S_test)
+        hellinger = hellinger_distance_weighted(P, F_test, S_test)
+
+        metrics[name] = {
+            "Log-Likelihood": ll,
+            "KL Divergence": kl,
+            "MSE": mse,
+            "Hellinger Distance": hellinger
+        }
+
+    return metrics
+
+# Запуск сравнения
+metrics = compare_matrices(migration_matrix, final_matrix, F_test, S_test)
+
+# Вывод результатов
+for name, scores in metrics.items():
+    print(f"=== {name} ===")
+    for metric, value in scores.items():
+        print(f"{metric}: {value:.6f}")
+    print()

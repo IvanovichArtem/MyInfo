@@ -1,10 +1,35 @@
-array([[-1.29889635e-01,  2.85711272e-02,  3.46061876e-04,
-         0.00000000e+00,  0.00000000e+00,  4.20449008e-04],
-       [-2.71794410e-01,  3.83682359e-01, -9.71398919e-02,
-         1.46607335e-02,  0.00000000e+00,  2.84288214e-03],
-       [ 1.31063658e-01,  7.42221868e-02,  1.91158759e-01,
-        -3.39632240e-01,  4.88691116e-02,  1.57668378e-02],
-       [ 1.22674084e-02,  7.71750325e-02,  2.02527053e-02,
-         5.14920666e-02, -2.86665368e-01,  7.71071138e-02],
-       [ 1.16108611e-03,  1.28722081e-03,  7.76213553e-04,
-         2.02785791e-03,  5.70698078e-01, -5.90617658e-01]])
+import numpy as np
+from scipy.optimize import least_squares
+
+class AlphaCalibration:
+    def __init__(self, X, valid_matrix, r_s_valid):
+        """
+        X — матрица миграций, построенная на train
+        valid_matrix — матрица, построенная на valid
+        r_s_valid — коэффициент дефолтов (скаляр), посчитанный на valid
+        """
+        assert X.shape == valid_matrix.shape, "X и valid_matrix должны иметь одинаковую размерность."
+        self.X = X.values
+        self.valid_matrix = valid_matrix.values
+        self.r_s_valid = r_s_valid
+        self.shape = X.shape
+        # Начальное приближение для матрицы alpha: единицы
+        self.alpha0 = np.ones(self.shape).flatten()
+
+    def residuals(self, alpha_flat):
+        """
+        Функция остатков: разница между предсказанной и фактической valid_matrix.
+        Предсказанная valid_matrix = X + alpha * (r_s_valid - 1)
+        """
+        alpha = alpha_flat.reshape(self.shape)
+        pred = self.X + alpha * (self.r_s_valid - 1)
+        return (pred - self.valid_matrix).flatten()
+
+    def calibrate(self):
+        """
+        Калибрует матрицу alpha с использованием метода наименьших квадратов.
+        Ограничения: alpha >= 0
+        """
+        result = least_squares(self.residuals, self.alpha0, bounds=(-1, 1))
+        self.alpha_opt = result.x.reshape(self.shape)
+        return self.alpha_opt

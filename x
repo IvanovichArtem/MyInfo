@@ -33,3 +33,43 @@ class AlphaCalibration:
         result = least_squares(self.residuals, self.alpha0, bounds=(-1, 1))
         self.alpha_opt = result.x.reshape(self.shape)
         return self.alpha_opt
+==============================================================================
+class AlphaCalibration:
+    def __init__(self, matrices, r_s_valid):
+        """
+        matrices — список кортежей [(X, valid_matrix), ...], где
+                   X — матрица миграций, построенная на train
+                   valid_matrix — матрица, построенная на valid
+        r_s_valid — коэффициент дефолтов (скаляр), посчитанный на valid
+        """
+        # Проверяем, что все матрицы имеют одинаковую форму
+        shapes = [X.shape for X, valid_matrix in matrices]
+        assert len(set(shapes)) == 1, "Все матрицы должны иметь одинаковую размерность."
+        
+        self.matrices = [(X.values, valid_matrix.values) for X, valid_matrix in matrices]
+        self.r_s_valid = r_s_valid
+        self.shape = shapes[0]
+        # Начальное приближение для матрицы alpha: единицы
+        self.alpha0 = np.ones(self.shape).flatten()
+
+    def residuals(self, alpha_flat):
+        """
+        Функция остатков: разница между предсказанной и фактической valid_matrix
+        для всех пар матриц.
+        Предсказанная valid_matrix = X + alpha * (r_s_valid - 1)
+        """
+        alpha = alpha_flat.reshape(self.shape)
+        residuals = []
+        for X, valid_matrix in self.matrices:
+            pred = X + alpha * (self.r_s_valid - 1)
+            residuals.append((pred - valid_matrix).flatten())
+        return np.concatenate(residuals)
+
+    def calibrate(self):
+        """
+        Калибрует единую матрицу alpha с использованием метода наименьших квадратов.
+        Ограничения: alpha >= 0
+        """
+        result = least_squares(self.residuals, self.alpha0, bounds=(0, np.inf))
+        self.alpha_opt = result.x.reshape(self.shape)
+        return self.alpha_opt

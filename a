@@ -8,10 +8,12 @@ def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix
     for index, row in df.iterrows():
         current_id = row[id_col]
         current_state = latest_gr.get(current_id, row[col])
-        
+
         if p:
-            next_state = np.random.choice(migration_matrix.columns, 
-                                          p=migration_matrix.loc[current_state].values)
+            next_state = np.random.choice(
+                migration_matrix.columns,
+                p=migration_matrix.loc[current_state].values
+            )
         elif current_state in migration_matrix.index:
             next_state = migration_matrix.loc[current_state].idxmax()
         else:
@@ -22,20 +24,44 @@ def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix
 
     df[f'predicted_next_{col}'] = predicted_values
 
-    # Суммы и отклонения для "Задолженность"
-    if col == "Задолженность" and view:
-        actual_sum = df[col].sum()
-        predicted_sum = df[f'predicted_next_{col}'].sum()
-        error_pct = ((predicted_sum - actual_sum) / actual_sum) * 100 if actual_sum != 0 else 0
+    # === Общий расчёт по задолженности ===
+    if "Задолженность" in df.columns:
+        total_actual = df["Задолженность"].sum()
+        # Используем предсказанную группу, чтобы посчитать задолженность
+        df["predicted_next_group"] = df[f'predicted_next_{col}']
+        total_predicted = df.groupby("predicted_next_group")["Задолженность"].sum().sum()
+        total_error_pct = ((total_predicted - total_actual) / total_actual * 100) if total_actual != 0 else 0
 
-        print("\n[Задолженность] Фактическая сумма задолженности:", actual_sum)
-        print("[Задолженность] Предсказанная сумма задолженности:", predicted_sum)
-        print(f"[Задолженность] Отклонение от фактической суммы: {error_pct:.2f}%")
+        print("\n[Общий расчёт по 'Задолженность']:")
+        print("Фактическая сумма:", round(total_actual, 2))
+        print("Предсказанная сумма:", round(total_predicted, 2))
+        print(f"Отклонение: {total_predicted - total_actual:.2f}")
+        print(f"Отклонение в процентах: {total_error_pct:.2f}%")
 
-    # Accuracy и метрики
+        # === Расчёт по категориям ===
+        actual_debt = df.groupby(col)["Задолженность"].sum()
+        predicted_debt = df.groupby("predicted_next_group")["Задолженность"].sum()
+
+        debt_compare = pd.DataFrame({
+            "Факт_задолженность": actual_debt,
+            "Предсказ_задолженность": predicted_debt
+        }).fillna(0)
+
+        debt_compare["Отклонение"] = (
+            debt_compare["Предсказ_задолженность"] - debt_compare["Факт_задолженность"]
+        )
+        debt_compare["Отклонение_в_процентах"] = (
+            debt_compare["Отклонение"] / debt_compare["Факт_задолженность"].replace(0, np.nan) * 100
+        ).fillna(0)
+
+        if view:
+            print("\nЗадолженность по категориям (факт vs предсказание):")
+            print(debt_compare.round(2))
+
+    # === Accuracy, Confusion Matrix, Classification Report ===
     target = df[col].shift(-1).dropna()
     predict = df[f"predicted_next_{col}"].iloc[:-1]
-    
+
     accurancy = accuracy_score(target, predict)
     if view:
         print(f"\nAccuracy score {accurancy:.4f}")
@@ -51,7 +77,8 @@ def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix
         plt.ylabel("Фактическое")
         plt.title("Confusion matrix")
         plt.show()
-    
-    class_report = classification_report(target, predict, labels=labels, 
-                                         zero_division=0, output_dict=not view)
+
+    class_report = classification_report(
+        target, predict, labels=labels, zero_division=0, output_dict=not view
+    )
     return class_report

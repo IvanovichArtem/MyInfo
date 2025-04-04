@@ -1,213 +1,57 @@
-def adjust_migration_matrix(migration_matrix, r):
-    """
-    Корректирует матрицу миграции в зависимости от коэффициента R_t.
-    :param migration_matrix: np.array, базовая матрица переходов
-    :param r: float, коэффициент изменения (R_t)
-    :return: скорректированная матрица np.array
-    """
-    adjusted_matrix = migration_matrix.copy()
-    num_states = migration_matrix.shape[0]
-    
-    for i in range(num_states):
-        for j in range(num_states):
-            if j < i:  # Понижение рейтинга
-                adjusted_matrix[i, j] *= r
-            elif j > i:  # Повышение рейтинга
-                adjusted_matrix[i, j] /= r
-    
-    # Нормализация строк до 1
-    adjusted_matrix /= adjusted_matrix.sum(axis=1, keepdims=True)
-    
-    return adjusted_matrix
+def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix, p=False, view=True):
+    df = df.copy()
+    df = df.sort_values([id_col, dt_col]).reset_index(drop=True)
 
-
-
-
-def simulate_total_loss(portfolio_df, migration_matrix, default_label='D'):
-    """
-    Симулирует кредитные переходы для каждого кредита по времени и возвращает общий агрегированный loss.
-    :param portfolio_df: DataFrame с колонками ['id', 'dt', 'bucket_NPL', 'Задолженность']
-    :param migration_matrix: DataFrame с миграционной матрицей (строки - текущие рейтинги, столбцы - будущие)
-    :param default_label: Метка дефолта, например, 'D'
-    :return: Общий агрегированный loss по всему портфелю
-    """
-    portfolio_df = portfolio_df.sort_values(by=['id', 'dt'])
-    total_loss = 0
-    
-    for credit_id, credit_data in portfolio_df.groupby('id'):
-        current_state = credit_data.iloc[0]['bucket_NPL']
-        for idx, row in credit_data.iterrows():
-            if current_state not in migration_matrix.index:
-                new_state = current_state
-            else:
-                probs = migration_matrix.loc[current_state].values
-                new_state = np.random.choice(migration_matrix.columns, p=probs)
-            if new_state == default_label:
-                total_loss += row['Задолженность']
-            current_state = new_state
-            
-    return total_loss
-
-import numpy as np
-import pandas as pd
-from scipy.optimize import minimize
-from sklearn.metrics import f1_score
-from tqdm import tqdm
-
-# === ФУНКЦИЯ КОРРЕКТИРОВКИ МАТРИЦЫ ===
-def adjusted_matrix(alpha, original_matrix, r):
-    """Корректирует миграционную матрицу с коэффициентами α."""
-    alpha = alpha.reshape(original_matrix.shape)
-    new_matrix = original_matrix + alpha * (r - 1)
-    new_matrix = np.clip(new_matrix, 0, 1)  # Убеждаемся, что вероятности остаются в [0,1]
-    
-    # Нормировка, чтобы каждая строка суммировалась в 1
-    row_sums = new_matrix.sum(axis=1, keepdims=True)
-    new_matrix = new_matrix / row_sums
-    return new_matrix
-
-# === ФУНКЦИЯ ПОЛУЧЕНИЯ ПРЕДСКАЗАНИЙ ===
-def get_predictions(df, id_col, dt_col, col, migration_matrix):
-    """Предсказывает `next_<col>` на основе миграционной матрицы."""
-    df_copy = df.copy()
-    df_copy = df_copy.sort_values([id_col, dt_col]).reset_index(drop=True)
-    latest_states = dict(zip(df_copy[id_col], df_copy[col]))
+    latest_gr = dict(zip(df[id_col], df[col]))
     predicted_values = []
-    
-    for _, row in tqdm(df_copy.iterrows(), total=df_copy.shape[0]):
-        current_id = row[id_col]
-        current_state = latest_states.get(current_id, row[col])
 
-        if current_state in migration_matrix.index:
+    for index, row in df.iterrows():
+        current_id = row[id_col]
+        current_state = latest_gr.get(current_id, row[col])
+        
+        if p:
+            next_state = np.random.choice(migration_matrix.columns, 
+                                          p=migration_matrix.loc[current_state].values)
+        elif current_state in migration_matrix.index:
             next_state = migration_matrix.loc[current_state].idxmax()
         else:
-            next_state = current_state  # Если неизвестно, оставляем текущее состояние
+            next_state = current_state
 
-        latest_states[current_id] = next_state
+        latest_gr[current_id] = next_state
         predicted_values.append(next_state)
+
+    df[f'predicted_next_{col}'] = predicted_values
+
+    # Суммы и отклонения для "Задолженность"
+    if col == "Задолженность" and view:
+        actual_sum = df[col].sum()
+        predicted_sum = df[f'predicted_next_{col}'].sum()
+        error_pct = ((predicted_sum - actual_sum) / actual_sum) * 100 if actual_sum != 0 else 0
+
+        print("\n[Задолженность] Фактическая сумма задолженности:", actual_sum)
+        print("[Задолженность] Предсказанная сумма задолженности:", predicted_sum)
+        print(f"[Задолженность] Отклонение от фактической суммы: {error_pct:.2f}%")
+
+    # Accuracy и метрики
+    target = df[col].shift(-1).dropna()
+    predict = df[f"predicted_next_{col}"].iloc[:-1]
     
-    return predicted_values
+    accurancy = accuracy_score(target, predict)
+    if view:
+        print(f"\nAccuracy score {accurancy:.4f}")
 
-# === ФУНКЦИЯ ПОТЕРЬ ДЛЯ ВСЕХ КЛАССОВ ===
-def loss_function_per_class(alpha, original_matrix, r, df, id_col, dt_col, col, state_names):
-    """Оптимизируем F1 для каждого класса отдельно и минимизируем их среднее."""
-    new_matrix = adjusted_matrix(alpha, original_matrix, r)
-    migration_matrix_df = pd.DataFrame(new_matrix, index=state_names, columns=state_names)
+    labels = sorted(df[col].dropna().unique())
+    conf_mat = confusion_matrix(target, predict, labels=labels)
+    conf_df = pd.DataFrame(conf_mat, index=labels, columns=labels)
+    if view:
+        print("\nConfusion matrix:")
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(conf_df, annot=True, fmt='d', cmap='Blues', linewidths=0.5)
+        plt.xlabel("Предсказано")
+        plt.ylabel("Фактическое")
+        plt.title("Confusion matrix")
+        plt.show()
     
-    predictions = get_predictions(df, id_col, dt_col, col, migration_matrix_df)
-    y_true = df[col].shift(-1).dropna().values
-    y_pred = np.array(predictions[:-1])
-    
-    losses = []
-    for state in state_names:
-        y_true_bin = (y_true == state).astype(int)
-        y_pred_bin = (y_pred == state).astype(int)
-        f1 = f1_score(y_true_bin, y_pred_bin)
-        losses.append(1 - f1)  # Хотим минимизировать 1 - F1 для этого класса
-    
-    return np.mean(losses)
-
-# === ФУНКЦИЯ ОПТИМИЗАЦИИ ВСЕЙ МАТРИЦЫ ===
-def optimize_alpha(original_matrix, r, df, id_col, dt_col, col):
-    """Оптимизирует всю матрицу сразу, минимизируя среднее 1 - F1."""
-    state_names = list(original_matrix.index)  # Используем индексы матрицы как имена статусов
-    initial_guess = np.zeros(original_matrix.shape).flatten()
-    
-    result = minimize(loss_function_per_class, initial_guess,
-                      args=(original_matrix, r, df, id_col, dt_col, col, state_names),
-                      method='Nelder-Mead')
-    
-    optimized_alpha = result.x.reshape(original_matrix.shape)
-    final_matrix = adjusted_matrix(optimized_alpha, original_matrix, r)
-    return optimized_alpha, final_matrix
-
-# === ФУНКЦИЯ ПОТЕРЬ ДЛЯ ОТДЕЛЬНОЙ СТРОКИ ===
-def loss_function_row(alpha_row, row_index, current_alpha, original_matrix, r, df, id_col, dt_col, col, state_names):
-    """Оптимизирует F1 только для одного статуса (строки матрицы)."""
-    temp_alpha = current_alpha.copy()
-    temp_alpha[row_index, :] = alpha_row
-    new_matrix = adjusted_matrix(temp_alpha, original_matrix, r)
-    migration_matrix_df = pd.DataFrame(new_matrix, index=state_names, columns=state_names)
-    
-    predictions = get_predictions(df, id_col, dt_col, col, migration_matrix_df)
-    y_true = df[col].shift(-1).dropna().values
-    y_pred = np.array(predictions[:-1])
-    
-    # Оптимизируем F1 только для текущего статуса
-    target_state = state_names[row_index]
-    y_true_bin = (y_true == target_state).astype(int)
-    y_pred_bin = (y_pred == target_state).astype(int)
-    f1 = f1_score(y_true_bin, y_pred_bin)
-    
-    return 1 - f1
-
-# === ФУНКЦИЯ ОПТИМИЗАЦИИ ПО СТРОКАМ ===
-def optimize_alpha_per_row(original_matrix, r, df, id_col, dt_col, col):
-    """Оптимизирует F1 отдельно для каждого статуса (строки)."""
-    state_names = list(original_matrix.index)
-    optimized_alpha = np.zeros_like(original_matrix)
-    
-    for i in range(original_matrix.shape[0]):
-        initial_guess_row = optimized_alpha[i, :].flatten()
-        
-        res = minimize(loss_function_row, initial_guess_row,
-                       args=(i, optimized_alpha, original_matrix, r, df, id_col, dt_col, col, state_names),
-                       method='Nelder-Mead')
-        
-        optimized_alpha[i, :] = res.x
-        print(f"Оптимизировано для строки {state_names[i]}: {optimized_alpha[i, :]}")
-    
-    final_matrix = adjusted_matrix(optimized_alpha, original_matrix, r)
-    return optimized_alpha, final_matrix
-
-# === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
-# Предполагается, что у вас есть DataFrame df с колонками ['id', 'date', 'status']
-# Предполагается, что original_matrix уже представлена в виде DataFrame с индексами = state_names
-# r = 0.63  # Пример значения риска
-
-# Оптимизация всей матрицы:
-# optimized_alpha, final_matrix = optimize_alpha(original_matrix, r, df, 'id', 'date', 'status')
-
-# Оптимизация по строкам:
-# optimized_alpha, final_matrix = optimize_alpha_per_row(original_matrix, r, df, 'id', 'date', 'status')
-
-
-def optimize_alpha_per_row_grid_search(original_matrix, r, df, id_col, dt_col, col, grid_values):
-    """
-    Оптимизирует коэффициенты α для каждой строки (статуса) отдельно с использованием grid search.
-    grid_values – массив значений, которые мы перебираем для каждого элемента.
-    """
-    state_names = list(original_matrix.index)
-    optimized_alpha = np.zeros_like(original_matrix)
-    losses = []
-    
-    for i in range(original_matrix.shape[0]):
-        best_alpha_row, best_loss = grid_search_for_row(i, optimized_alpha, original_matrix, r, df, id_col, dt_col, col, state_names, grid_values)
-        optimized_alpha[i, :] = best_alpha_row
-        losses.append(best_loss)
-        print(f"Статус {state_names[i]}: лучшая alpha = {best_alpha_row}, loss = {best_loss}")
-    
-    final_matrix = adjusted_matrix(optimized_alpha, original_matrix, r)
-    return optimized_alpha, final_matrix, losses
-
-
-# === GRID SEARCH ДЛЯ ОДНОЙ СТРОКИ ===
-def grid_search_for_row(row_index, current_alpha, original_matrix, r, df, id_col, dt_col, col, state_names, grid_values):
-    best_loss = np.inf
-    best_alpha_row = None
-    n = original_matrix.shape[1]
-    
-    # Перебираем все комбинации для текущей строки
-    for candidate in product(grid_values, repeat=n):
-        candidate = np.array(candidate)
-        loss = loss_function_row(candidate, row_index, current_alpha, original_matrix, r, df, id_col, dt_col, col, state_names)
-        if loss < best_loss:
-            best_loss = loss
-            best_alpha_row = candidate.copy()
-    return best_alpha_row, best_loss
-
-
-
-
-
-
+    class_report = classification_report(target, predict, labels=labels, 
+                                         zero_division=0, output_dict=not view)
+    return class_report

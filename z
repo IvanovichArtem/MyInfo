@@ -1,89 +1,55 @@
-import numpy as np
-from scipy.optimize import least_squares
-
 class AlphaCalibrator:
-    def __init__(self, x, nmatrices, r_s_valid):
+    def __init__(self, migration_matrix, r_s_valid, target_matrices):
         """
-        x: какие-то дополнительные данные, если нужны
-        nmatrices: список матриц (numpy-массивов), построенных на train
-        r_s_valid: валидационная матрица (или вектор), с которой сравниваем результат
+        migration_matrix: базовая матрица (numpy array)
+        r_s_valid: матрица, которая влияет на масштабирование α
+        target_matrices: список матриц, для которых должно выполняться приближение:
+            migration_matrix + (r_s_valid - 1) * α**(i+1) ≈ target_matrices[i]
         """
-        self.x = x
-        self.nmatrices = nmatrices
+        self.migration_matrix = migration_matrix
         self.r_s_valid = r_s_valid
-
-        # Запоминаем форму каждой матрицы, чтобы корректно "разворачивать" и "сворачивать" альфа-параметры
-        self.shapes = [m.shape for m in self.nmatrices]
-        # Полное количество элементов (альфа-параметров) во всех матрицах
-        self.num_params = sum(m.size for m in self.nmatrices)
-
-    def _unpack_alphas(self, alpha_flat):
-        """
-        Превращает одномерный вектор alpha_flat в список двумерных (или 1D) массивов
-        соответствующих форм (как у матриц в self.nmatrices).
-        """
-        alphas = []
-        idx = 0
-        for shape in self.shapes:
-            size = np.prod(shape)  # произведение размеров = общее число элементов
-            arr = alpha_flat[idx:idx + size].reshape(shape)
-            alphas.append(arr)
-            idx += size
-        return alphas
-
-    def _pack_alphas(self, alpha_list):
-        """
-        Превращает список альфа-массивов обратно в один вектор для оптимизатора.
-        """
-        return np.concatenate([a.ravel() for a in alpha_list])
+        self.target_matrices = target_matrices
+        
+        # Проверяем, что все матрицы имеют одинаковую размерность
+        shape = migration_matrix.shape
+        assert r_s_valid.shape == shape, "r_s_valid должна иметь ту же размерность, что и migration_matrix"
+        for idx, m in enumerate(target_matrices):
+            assert m.shape == shape, f"matrix[{idx}] имеет другую размерность"
+        self.shape = shape
 
     def _residuals(self, alpha_flat):
         """
-        Функция, которую будет минимизировать least_squares.
-        Возвращает вектор «остатков», которые нужно занулить или минимизировать.
+        Функция остатков, которую необходимо минимизировать.
+        alpha_flat: одномерный вектор, который при reshape даёт матрицу α.
+        Для каждого индекса i вычисляем:
+          residual = (migration_matrix + (r_s_valid - 1) * α^(i+1)  - target_matrices[i])
+        Все остатки объединяются в один вектор.
         """
-        # "Разворачиваем" все альфа-параметры
-        alphas = self._unpack_alphas(alpha_flat)
-
-        # Для каждой матрицы берём соответствующую "альфу" и возводим матрицу в степень
-        preds = []
-        for m, a in zip(self.nmatrices, alphas):
-            # np.power(m, a) - возводим в вещественную степень поэлементно
-            # Если форма m и a совпадают, это поэлементное возведение
-            # Если a скаляр, то нужна простая broadcast-логика
-            p = np.power(m, a)  
-            preds.append(p)
-
-        # Допустим, мы хотим «суммарный» предикт (или средний) – зависит от вашей задачи
-        # Если ваша цель – чтобы сумма по всем матрицам как-то соответствовала r_s_valid,
-        # то, к примеру, берём сумму по всем preds (или делаем что-то иное по задаче).
-        pred_sum = np.sum(preds, axis=0)
-        
-        # Возвращаем разницу, которую будет минимизировать least_squares
-        # (least_squares сводит к нулю вектор, так что это фактически r_s_valid - pred_sum).
-        return (pred_sum - self.r_s_valid).ravel()
+        # Восстанавливаем матрицу α из векторного представления
+        alpha = alpha_flat.reshape(self.shape)
+        residuals = []
+        for i, target in enumerate(self.target_matrices):
+            # Возведение матрицы α в степень (i+1), используя np.linalg.matrix_power
+            alpha_power = np.linalg.matrix_power(alpha, i + 1)
+            # Моделируем приближение
+            model_pred = self.migration_matrix + (self.r_s_valid - 1) * alpha_power
+            # Остаток для текущей матрицы (разность поэлементно)
+            res = (model_pred - target).ravel()
+            residuals.append(res)
+        return np.concatenate(residuals)
 
     def calibrate(self, alpha_init=None, bounds=None):
         """
-        Запуск оптимизации. Возвращаем найденные альфа-массивы.
-        alpha_init: начальное приближение для всех альф (одномерный numpy массив соответствующего размера)
-        bounds: если нужно, кортеж (min_bound, max_bound) в формате, подходящем для least_squares
+        Запускаем оптимизацию, возвращаем оптимизированную матрицу α.
+        alpha_init: начальное приближение для матрицы α (если None, инициализируем нулями)
+        bounds: ограничения для элементов матрицы α в формате (lb, ub)
         """
         if alpha_init is None:
-            # Пусть все альфы начнутся с нулей (или единиц) – зависит от задачи
-            alpha_init = np.zeros(self.num_params, dtype=float)
-
+            alpha_init = np.ones(self.shape).ravel()  # можно менять, здесь начальное приближение = 1
         if bounds is None:
-            # Можем не ограничивать или поставить что-то вроде (0, np.inf), смотрите по задаче
-            # Формат для least_squares: bounds=(lb, ub), где lb и ub – массивы или скаляры
             bounds = (-np.inf, np.inf)
 
-        # Запускаем оптимизацию методом наименьших квадратов
-        result = least_squares(self._residuals, alpha_init, bounds=bounds)
-
-        # Сохраняем результат и "раскладываем" альфа-параметры обратно по матрицам
-        self.alpha_flat_ = result.x
-        self.alphas_ = self._unpack_alphas(result.x)
-
-        # Можем вернуть что-то полезное
-        return self.alphas_
+        # Запуск оптимизации методом наименьших квадратов
+        res = least_squares(self._residuals, alpha_init, bounds=bounds)
+        self.alpha_opt = res.x.reshape(self.shape)
+        return self.alpha_opt

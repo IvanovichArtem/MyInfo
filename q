@@ -1,4 +1,4 @@
-def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix, p=False, view=True):
+def predict_and_evaluate_alternative(df: pd.DataFrame, id_col, dt_col, col, migration_matrix, p=False, view=True):
     df = df.copy()
     df = df.sort_values([id_col, dt_col]).reset_index(drop=True)
     predictions = []
@@ -35,8 +35,13 @@ def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix
     pred_vals = [p[1] for p in predictions]
     df[f'predicted_next_{col}'] = pred_vals
 
-    target = df[col].shift(-1).dropna()
-    predict = df[f'predicted_next_{col}'].iloc[:-1]
+    # смещение target на -1 для сравнения с предиктом
+    df["target_next_state"] = df[col].shift(-1)
+    df_result = df[[id_col, dt_col, col, f'predicted_next_{col}', "target_next_state"]].iloc[:-1]
+
+    # метрики
+    target = df_result["target_next_state"]
+    predict = df_result[f'predicted_next_{col}']
 
     acc = accuracy_score(target, predict)
     print(f"\nAccuracy score {acc:.4f}")
@@ -44,6 +49,7 @@ def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix
     labels = sorted(df[col].dropna().unique())
     cm = confusion_matrix(target, predict, labels=labels)
     cm_df = pd.DataFrame(cm, index=labels, columns=labels)
+
     if view:
         print("\nConfusion matrix:")
         plt.figure(figsize=(8, 6))
@@ -54,4 +60,4 @@ def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix
         plt.show()
 
     cr = classification_report(target, predict, labels=labels, zero_division=0, output_dict=not view)
-    return cr
+    return cr, df_result

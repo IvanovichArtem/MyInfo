@@ -1,0 +1,40 @@
+class AlphaCalibration:
+    def __init__(self, matrices, r_s_valid, lambda_reg=1e-2):
+        """
+        matrices — список кортежей [(X, valid_matrix), ...], где
+                   X — матрица миграций, построенная на train
+                   valid_matrix — матрица, построенная на valid
+        r_s_valid — коэффициент дефолтов (скаляр), посчитанный на valid
+        lambda_reg — коэффициент регуляризации (L2)
+        """
+        shapes = [X.shape for X, valid_matrix in matrices]
+        assert len(set(shapes)) == 1, "Все матрицы должны иметь одинаковую размерность."
+        self.matrices = []
+        for X, valid in matrices:
+            mask = ~np.isnan(valid)
+            # Заменяем NaN на 0, но храним маску для взвешивания ошибки
+            valid_filled = np.nan_to_num(valid, nan=0.0)
+            self.matrices.append((X, valid_filled, mask.astype(float)))
+        self.r_s_valid = r_s_valid
+        self.lambda_reg = lambda_reg
+        self.shape = shapes[0]
+
+    def calibrate(self):
+        """
+        Калибрует alpha-матрицу через CVXPY с ограничением alpha >= 0 и L2-регуляризацией.
+        """
+        n_rows, n_cols = self.shape
+        alpha = cp.Variable((n_rows, n_cols), nonneg=True)
+        objective_terms = []
+        for X, valid, mask in self.matrices:
+            # предсказание: X + alpha * (r_s_valid - 1)
+            pred = X + cp.multiply(alpha, (self.r_s_valid - 1))
+            # учитываем только известные элементы через маску
+            diff = cp.multiply(pred - valid, mask)
+            objective_terms.append(cp.sum_squares(diff))
+        # общая цель + регуляризация
+        objective = cp.sum(objective_terms) + self.lambda_reg * cp.sum_squares(alpha)
+        problem = cp.Problem(cp.Minimize(objective))
+        problem.solve(solver=cp.SCS)
+        self.alpha_opt = alpha.value
+        return self.alpha_opt

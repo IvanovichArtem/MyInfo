@@ -1,54 +1,41 @@
-def predict_and_evaluate(df: pd.DataFrame, id_col, dt_col, col, migration_matrix, p=False, view=True):
-    df = df.copy()
-    df = df.sort_values([id_col, dt_col]).reset_index(drop=True)
+def evaluate_all_metrics(y_true, y_pred):
+    """
+    Вычисляет и выводит значения всех метрик для заданных реальных и предсказанных значений.
+    """
 
-    latest_gr = dict(zip(df[id_col], df[col]))
-    predicted_values = []
+    def clipped_error(y_true, y_pred, threshold=500):
+        y_true, y_pred = np.array(y_true), np.array(y_pred)
+        errors = np.abs((y_true - y_pred) / y_true) * 100
+        return np.minimum(errors, threshold).mean()
 
-    for index, row in df.iterrows():
-        current_id = row[id_col]
-        current_state = latest_gr.get(current_id, row[col])
+    # Logarithmic Error
+    def log_error(y_true, y_pred, epsilon=1e-8):
+        y_true, y_pred = np.array(y_true), np.array(y_pred)
+        return np.mean(np.abs(np.log(y_true + epsilon) - np.log(y_pred + epsilon)))
 
-        if p and current_state in migration_matrix.index:
-            next_state = np.random.choice(
-                migration_matrix.columns,
-                p=migration_matrix.loc[current_state].values
-            )
-        elif current_state in migration_matrix.index:
-            next_state = migration_matrix.loc[current_state].idxmax()
-        else:
-            next_state = current_state
+    # Weighted MAPE
+    def wmape(y_true, y_pred):
+        y_true, y_pred = np.array(y_true), np.array(y_pred)
+        return np.sum(np.abs(y_true - y_pred)) / np.sum(y_true) * 100
 
-        latest_gr[current_id] = next_state
-        predicted_values.append(next_state)
+    # Huber Loss
+    def huber_loss(y_true, y_pred, delta=1.0):
+        y_true, y_pred = np.array(y_true), np.array(y_pred)
+        error = y_true - y_pred
+        is_small_error = np.abs(error) <= delta
+        squared_loss = 0.5 * error**2
+        linear_loss = delta * (np.abs(error) - 0.5 * delta)
+        return np.mean(np.where(is_small_error, squared_loss, linear_loss))
 
-    df[f'predicted_next_{col}'] = predicted_values
+    # Modified sMAPE
+    def modified_smape(y_true, y_pred, epsilon=1e-6):
+        y_true, y_pred = np.array(y_true), np.array(y_pred)
+        denominator = np.maximum(np.abs(y_true) + np.abs(y_pred), epsilon)
+        return np.mean(np.abs(y_true - y_pred) / denominator) * 100
 
-    # Смещение target на 1 строку вверх
-    df["target"] = df[col].shift(-1)
-    df["pred"] = df[f"predicted_next_{col}"]
-
-    # Убираем последнюю строку, т.к. у неё нет фактического следующего значения
-    result_df = df.iloc[:-1][[id_col, dt_col, col, "target", "pred"]].copy()
-
-    # Accuracy и визуализация
-    accuracy = accuracy_score(result_df["target"], result_df["pred"])
-    if view:
-        print(f"\nAccuracy score: {accuracy:.4f}")
-
-        labels = sorted(df[col].dropna().unique())
-        conf_mat = confusion_matrix(result_df["target"], result_df["pred"], labels=labels)
-        conf_df = pd.DataFrame(conf_mat, index=labels, columns=labels)
-
-        print("\nConfusion matrix:")
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(conf_df, annot=True, fmt='d', cmap='Blues', linewidths=0.5)
-        plt.xlabel("Предсказано")
-        plt.ylabel("Фактическое")
-        plt.title("Confusion Matrix")
-        plt.show()
-
-        print("\nClassification report:")
-        print(classification_report(result_df["target"], result_df["pred"], labels=labels, zero_division=0))
-
-    return result_df
+    print("=== Метрики ошибок ===")
+    print(f"Clipped Error: {clipped_error(y_true, y_pred):.2f}%")
+    print(f"Logarithmic Error: {log_error(y_true, y_pred):.4f}")
+    print(f"WMAPE: {wmape(y_true, y_pred):.2f}%")
+    print(f"Huber Loss: {huber_loss(y_true, y_pred):.4f}")
+    print(f"Modified sMAPE: {modified_smape(y_true, y_pred):.2f}%")

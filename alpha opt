@@ -1,6 +1,6 @@
 Option Explicit
 
-' Основная процедура: ввод данных, конвертация в числа, калибровка и запись α с учетом границ
+' Main procedure: input data, convert to numbers, calibrate, and save α with limits considered
 Sub AlphaCalibration_Main()
     Dim nMatrices As Long
     Dim i As Long, j As Long, k As Long
@@ -16,16 +16,16 @@ Sub AlphaCalibration_Main()
     Dim nRows As Long, nCols As Long
     Dim s As String
     
-    ' 1) Ввод количества «валидных» матриц
+    ' 1) Input the number of "valid" matrices
     nMatrices = Application.InputBox( _
-        prompt:="Введите количество валидных матриц:", _
-        Title:="Калибровка α", Type:=1)
+        prompt:="Enter the number of valid matrices:", _
+        Title:="Calibration α", Type:=1)
     If nMatrices < 1 Then Exit Sub
     
-    ' 2) Выбор диапазона основной матрицы и конвертация в числа
+    ' 2) Select the range of the main matrix and convert to numbers
     Set rngMain = Application.InputBox( _
-        prompt:="Выберите диапазон main_matrix:", _
-        Title:="Калибровка α", Type:=8)
+        prompt:="Select the range for the main_matrix:", _
+        Title:="Calibration α", Type:=8)
     If rngMain Is Nothing Then Exit Sub
     rngMain.NumberFormat = "General": rngMain.Value = rngMain.Value
     mainArrRaw = rngMain.Value2
@@ -46,22 +46,22 @@ Sub AlphaCalibration_Main()
         Next j
     Next i
     
-    ' 3) Подготовка 3D-массива для «валидных» матриц
+    ' 3) Prepare a 3D array for the "valid" matrices
     ReDim matrices3D(1 To nMatrices, 1 To nRows, 1 To nCols)
     
-    ' 4) Считывание каждой «валидной» матрицы и конвертация в числа
+    ' 4) Read each "valid" matrix and convert to numbers
     For k = 1 To nMatrices
         Set rng = Application.InputBox( _
-            prompt:="Выберите диапазон валидной матрицы №" & k & ":", _
-            Title:="Калибровка α", Type:=8)
+            prompt:="Select the range for valid matrix #" & k & ":", _
+            Title:="Calibration α", Type:=8)
         If rng Is Nothing Then Exit Sub
         
         rng.NumberFormat = "General": rng.Value = rng.Value
         tmpArr = rng.Value2
         
         If UBound(tmpArr, 1) <> nRows Or UBound(tmpArr, 2) <> nCols Then
-            MsgBox "Размер валидной матрицы №" & k & " не совпадает с main_matrix!", _
-                   vbCritical, "Ошибка"
+            MsgBox "The size of valid matrix #" & k & " does not match the main_matrix!", _
+                   vbCritical, "Error"
             Exit Sub
         End If
         
@@ -78,43 +78,43 @@ Sub AlphaCalibration_Main()
         Next i
     Next k
     
-    ' 5) Ввод r_s_valid и параметра регуляризации
+    ' 5) Input r_s_valid and the regularization parameter
     r_s_valid = Application.InputBox( _
-        prompt:="Введите значение r_s_valid:", _
-        Title:="Калибровка α", Type:=1)
+        prompt:="Enter the value for r_s_valid:", _
+        Title:="Calibration α", Type:=1)
     delta = r_s_valid - 1
     lambda_reg = 0.01
     
-    ' 6) Ввод границ α как строк, затем конвертация
-    lbInput = InputBox("Введите нижнюю границу α (по умолчанию -0,2):", "Калибровка α", "-0,2")
+    ' 6) Input α limits as strings, then convert
+    lbInput = InputBox("Enter the lower limit for α (default -0.2):", "Calibration α", "-0.2")
     s = Val(Replace(CStr(lbInput), ",", "."))
     If IsNumeric(s) Then
         lb = CDbl(s)
     Else
-        MsgBox "Неверная нижняя граница!", vbCritical, "Ошибка"
+        MsgBox "Invalid lower limit!", vbCritical, "Error"
         Exit Sub
     End If
     
-    ubInput = InputBox("Введите верхнюю границу α (по умолчанию 0,2):", "Калибровка α", "0,2")
+    ubInput = InputBox("Enter the upper limit for α (default 0.2):", "Calibration α", "0.2")
     s = Val(Replace(CStr(ubInput), ",", "."))
     If IsNumeric(s) Then
         ub = CDbl(s)
     Else
-        MsgBox "Неверная верхняя граница!", vbCritical, "Ошибка"
+        MsgBox "Invalid upper limit!", vbCritical, "Error"
         Exit Sub
     End If
     
-    ' 7) Выбор места для вывода α
+    ' 7) Select a location to output α
     Set rngOut = Application.InputBox( _
-        prompt:="Выберите верхний-левый угол для записи α (размер " & nRows & "×" & nCols & "):", _
-        Title:="Калибровка α", Type:=8)
+        prompt:="Select the top-left corner for saving α (size " & nRows & "×" & nCols & "):", _
+        Title:="Calibration α", Type:=8)
     If rngOut Is Nothing Then Exit Sub
     If rngOut.Rows.Count < nRows Or rngOut.Columns.Count < nCols Then
-        MsgBox "Выбранный диапазон слишком мал!", vbCritical, "Ошибка"
+        MsgBox "The selected range is too small!", vbCritical, "Error"
         Exit Sub
     End If
     
-    ' 8) Расчёт α с учетом границ
+    ' 8) Calculate α considering the limits
     ReDim alphaArr(1 To nRows, 1 To nCols)
     Dim S_err As Double, S_denom As Double
     S_denom = (delta ^ 2) * nMatrices + lambda_reg
@@ -126,13 +126,13 @@ Sub AlphaCalibration_Main()
                 S_err = S_err + (matrices3D(k, i, j) - mainD(i, j))
             Next k
             alphaArr(i, j) = (delta * S_err) / S_denom
-            ' Применяем границы
+            ' Apply limits
             If alphaArr(i, j) < lb Then alphaArr(i, j) = lb
             If alphaArr(i, j) > ub Then alphaArr(i, j) = ub
         Next j
     Next i
     
-    ' 9) Запись α в лист
+    ' 9) Write α to the sheet
     rngOut.Resize(nRows, nCols).Value = alphaArr
-    MsgBox "Калибровка завершена — матрица α записана.", vbInformation, "Готово"
+    MsgBox "Calibration completed — α matrix saved.", vbInformation, "Done"
 End Sub

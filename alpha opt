@@ -1,6 +1,6 @@
 Option Explicit
 
-' Îñíîâíàÿ ïðîöåäóðà: ââîä äàííûõ, êîíâåðòàöèÿ â ÷èñëà, êàëèáðîâêà è çàïèñü ? ñ ó÷¸òîì ãðàíèö
+' Основная процедура: ввод данных, конвертация в числа, калибровка и запись α с учетом границ
 Sub AlphaCalibration_Main()
     Dim nMatrices As Long
     Dim i As Long, j As Long, k As Long
@@ -16,16 +16,16 @@ Sub AlphaCalibration_Main()
     Dim nRows As Long, nCols As Long
     Dim s As String
     
-    ' 1) Ââåäèòå êîëè÷åñòâî «âàëèäíûõ» ìàòðèö
+    ' 1) Ввод количества «валидных» матриц
     nMatrices = Application.InputBox( _
-        prompt:="Ââåäèòå êîëè÷åñòâî âàëèäíûõ ìàòðèö:", _
-        Title:="Êàëèáðîâêà ?", Type:=1)
+        prompt:="Введите количество валидных матриц:", _
+        Title:="Калибровка α", Type:=1)
     If nMatrices < 1 Then Exit Sub
     
-    ' 2) Âûáåðèòå äèàïàçîí îñíîâíîé ìàòðèöû è êîíâåðòèðóéòå â ÷èñëà
+    ' 2) Выбор диапазона основной матрицы и конвертация в числа
     Set rngMain = Application.InputBox( _
-        prompt:="Âûáåðèòå äèàïàçîí main_matrix:", _
-        Title:="Êàëèáðîâêà ?", Type:=8)
+        prompt:="Выберите диапазон main_matrix:", _
+        Title:="Калибровка α", Type:=8)
     If rngMain Is Nothing Then Exit Sub
     rngMain.NumberFormat = "General": rngMain.Value = rngMain.Value
     mainArrRaw = rngMain.Value2
@@ -46,22 +46,22 @@ Sub AlphaCalibration_Main()
         Next j
     Next i
     
-    ' 3) Ïîäãîòîâêà 3D-ìàññèâà äëÿ «âàëèäíûõ» ìàòðèö
+    ' 3) Подготовка 3D-массива для «валидных» матриц
     ReDim matrices3D(1 To nMatrices, 1 To nRows, 1 To nCols)
     
-    ' 4) Ñ÷èòûâàåì êàæäóþ «âàëèäíóþ» ìàòðèöó è êîíâåðòèðóåì â ÷èñëà
+    ' 4) Считывание каждой «валидной» матрицы и конвертация в числа
     For k = 1 To nMatrices
         Set rng = Application.InputBox( _
-            prompt:="Âûáåðèòå äèàïàçîí âàëèäíîé ìàòðèöû ¹" & k & ":", _
-            Title:="Êàëèáðîâêà ?", Type:=8)
+            prompt:="Выберите диапазон валидной матрицы №" & k & ":", _
+            Title:="Калибровка α", Type:=8)
         If rng Is Nothing Then Exit Sub
         
         rng.NumberFormat = "General": rng.Value = rng.Value
         tmpArr = rng.Value2
         
         If UBound(tmpArr, 1) <> nRows Or UBound(tmpArr, 2) <> nCols Then
-            MsgBox "Ðàçìåð âàëèäíîé ìàòðèöû ¹" & k & " íå ñîâïàäàåò ñ main_matrix!", _
-                   vbCritical, "Îøèáêà"
+            MsgBox "Размер валидной матрицы №" & k & " не совпадает с main_matrix!", _
+                   vbCritical, "Ошибка"
             Exit Sub
         End If
         
@@ -78,43 +78,43 @@ Sub AlphaCalibration_Main()
         Next i
     Next k
     
-    ' 5) Ââîä r_s_valid è ïàðàìåòðà ðåãóëÿðèçàöèè
+    ' 5) Ввод r_s_valid и параметра регуляризации
     r_s_valid = Application.InputBox( _
-        prompt:="Ââåäèòå çíà÷åíèå r_s_valid:", _
-        Title:="Êàëèáðîâêà ?", Type:=1)
+        prompt:="Введите значение r_s_valid:", _
+        Title:="Калибровка α", Type:=1)
     delta = r_s_valid - 1
     lambda_reg = 0.01
     
-    ' 6) Ââîä ãðàíèö ? êàê ñòðîê, çàòåì êîíâåðòàöèÿ
-    lbInput = InputBox("Ââåäèòå íèæíþþ ãðàíèöó ? (ïî óìîë÷àíèþ ?0,2):", "Êàëèáðîâêà ?", "-0,2")
+    ' 6) Ввод границ α как строк, затем конвертация
+    lbInput = InputBox("Введите нижнюю границу α (по умолчанию -0,2):", "Калибровка α", "-0,2")
     s = Val(Replace(CStr(lbInput), ",", "."))
     If IsNumeric(s) Then
         lb = CDbl(s)
     Else
-        MsgBox "Íåâåðíàÿ íèæíÿÿ ãðàíèöà!", vbCritical, "Îøèáêà"
+        MsgBox "Неверная нижняя граница!", vbCritical, "Ошибка"
         Exit Sub
     End If
     
-    ubInput = InputBox("Ââåäèòå âåðõíþþ ãðàíèöó ? (ïî óìîë÷àíèþ 0,2):", "Êàëèáðîâêà ?", "0,2")
+    ubInput = InputBox("Введите верхнюю границу α (по умолчанию 0,2):", "Калибровка α", "0,2")
     s = Val(Replace(CStr(ubInput), ",", "."))
     If IsNumeric(s) Then
         ub = CDbl(s)
     Else
-        MsgBox "Íåâåðíàÿ âåðõíÿÿ ãðàíèöà!", vbCritical, "Îøèáêà"
+        MsgBox "Неверная верхняя граница!", vbCritical, "Ошибка"
         Exit Sub
     End If
     
-    ' 7) Âûáîð ìåñòà äëÿ âûâîäà ?
+    ' 7) Выбор места для вывода α
     Set rngOut = Application.InputBox( _
-        prompt:="Âûáåðèòå âåðõíèé-ëåâûé óãîë äëÿ çàïèñè ? (ðàçìåð " & nRows & "?" & nCols & "):", _
-        Title:="Êàëèáðîâêà ?", Type:=8)
+        prompt:="Выберите верхний-левый угол для записи α (размер " & nRows & "×" & nCols & "):", _
+        Title:="Калибровка α", Type:=8)
     If rngOut Is Nothing Then Exit Sub
     If rngOut.Rows.Count < nRows Or rngOut.Columns.Count < nCols Then
-        MsgBox "Âûáðàííûé äèàïàçîí ñëèøêîì ìàë!", vbCritical, "Îøèáêà"
+        MsgBox "Выбранный диапазон слишком мал!", vbCritical, "Ошибка"
         Exit Sub
     End If
     
-    ' 8) Ðàñ÷¸ò ? ñ ó÷¸òîì ãðàíèö
+    ' 8) Расчёт α с учетом границ
     ReDim alphaArr(1 To nRows, 1 To nCols)
     Dim S_err As Double, S_denom As Double
     S_denom = (delta ^ 2) * nMatrices + lambda_reg
@@ -126,15 +126,13 @@ Sub AlphaCalibration_Main()
                 S_err = S_err + (matrices3D(k, i, j) - mainD(i, j))
             Next k
             alphaArr(i, j) = (delta * S_err) / S_denom
-            ' Ïðèìåíÿåì ãðàíèöû
+            ' Применяем границы
             If alphaArr(i, j) < lb Then alphaArr(i, j) = lb
             If alphaArr(i, j) > ub Then alphaArr(i, j) = ub
         Next j
     Next i
     
-    ' 9) Çàïèñü ? â ëèñò
+    ' 9) Запись α в лист
     rngOut.Resize(nRows, nCols).Value = alphaArr
-    MsgBox "Êàëèáðîâêà çàâåðøåíà — ìàòðèöà ? çàïèñàíà.", vbInformation, "Ãîòîâî"
+    MsgBox "Калибровка завершена — матрица α записана.", vbInformation, "Готово"
 End Sub
-
-

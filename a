@@ -5,24 +5,19 @@ def sample_all_binomial(P, counts, n_samples, random_seed=42):
     Сэмплирует каждое пересечение матрицы биномиально.
 
     :param P: numpy-массив shape (K, K+1) с нормализованными вероятностями переходов.
-    :param counts: numpy-массив длины K с числом наблюдений в каждой строке.
+    :param counts: numpy-массив shape (K, K+1) с числом наблюдений для каждого перехода.
     :param n_samples: количество генерируемых матриц.
     :param random_seed: для воспроизводимости.
     :return: numpy-массив shape (n_samples, K, K+1) с новыми матрицами переходов.
     """
     np.random.seed(random_seed)
-    K = P.shape[0]
-    samples = np.zeros((n_samples, K, K+1), dtype=int)
+    K, K_plus_1 = P.shape
+    samples = np.zeros((n_samples, K, K_plus_1), dtype=int)
 
     for s in range(n_samples):
         for i in range(K):
-            remaining = counts[i]
-            for j in range(K+1):
-                if remaining <= 0:
-                    break
-                # Сэмплирование биномиального распределения
-                count_ij = np.random.binomial(remaining, P[i, j])
-                samples[s, i, j] = count_ij
-                remaining -= count_ij
+            for j in range(K_plus_1):
+                # Сэмплирование биномиального распределения для каждого элемента
+                samples[s, i, j] = np.random.binomial(counts[i, j], P[i, j])
 
     return samples

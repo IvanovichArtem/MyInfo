@@ -1,23 +1,44 @@
 import numpy as np
+import pandas as pd
 
 def sample_all_binomial(P, counts, n_samples, random_seed=42):
     """
-    Сэмплирует каждое пересечение матрицы биномиально.
+    Сэмплирует матрицы переходов на основе вероятностей и количества наблюдений.
+    Выполняет нормализацию вероятностной матрицы P для каждой строки.
 
-    :param P: numpy-массив shape (K, K+1) с нормализованными вероятностями переходов.
-    :param counts: numpy-массив shape (K, K+1) с числом наблюдений для каждого перехода.
+    :param P: pandas DataFrame (K, K+1) с вероятностями переходов.
+    :param counts: pandas DataFrame (K, K+1) с числом наблюдений для каждого перехода.
     :param n_samples: количество генерируемых матриц.
     :param random_seed: для воспроизводимости.
-    :return: numpy-массив shape (n_samples, K, K+1) с новыми матрицами переходов.
+    :return: два DataFrame с нижними и верхними границами доверительных интервалов.
     """
     np.random.seed(random_seed)
-    K, K_plus_1 = P.shape
+    
+    # Конвертация входных данных в numpy-массивы
+    P_np = P.to_numpy()
+    counts_np = counts.to_numpy()
+
+    # Нормализация P по строкам
+    P_np = P_np / P_np.sum(axis=1, keepdims=True)
+
+    K, K_plus_1 = P_np.shape
     samples = np.zeros((n_samples, K, K_plus_1), dtype=int)
 
     for s in range(n_samples):
         for i in range(K):
             for j in range(K_plus_1):
-                # Сэмплирование биномиального распределения для каждого элемента
-                samples[s, i, j] = np.random.binomial(counts[i, j], P[i, j])
+                # Сэмплирование биномиального распределения для каждого элемента матрицы
+                samples[s, i, j] = np.random.binomial(counts_np[i, j], P_np[i, j])
 
-    return samples
+    # Нормализация сэмплированных матриц (перевод в вероятности)
+    normalized_samples = samples / samples.sum(axis=2, keepdims=True)
+
+    # Построение доверительных интервалов
+    lower_bound = np.percentile(normalized_samples, 2.5, axis=0)  # 2.5-й перцентиль
+    upper_bound = np.percentile(normalized_samples, 97.5, axis=0)  # 97.5-й перцентиль
+
+    # Преобразование результатов в DataFrame
+    lower_df = pd.DataFrame(lower_bound, index=P.index, columns=P.columns)
+    upper_df = pd.DataFrame(upper_bound, index=P.index, columns=P.columns)
+
+    return lower_df, upper_df

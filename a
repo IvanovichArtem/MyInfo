@@ -1,1 +1,76 @@
-Для всего датасета были созданы два новых признака на основе координат объектов, чтобы учесть пространственные закономерности в распределении цен. Первый признак, geo_cluster_tree_dtr, формировался с помощью DecisionTreeRegressor с ограничением на количество листьев до пяти. Это позволяет разбить все объекты на несколько географически связанных кластеров, в которых значения цены внутри кластера максимально схожи. Второй признак, geo_cluster_rf, создавался с помощью RandomForestRegressor с таким же ограничением на листья, при этом индекс листа усреднялся по всем деревьям. Такой подход делает разбиение более устойчивым и сглаживает влияние случайных особенностей отдельных деревьев. В результате оба признака кодируют локальные пространственные зависимости и позволяют модели лучше учитывать влияние географического положения на цену, повышая точность предсказаний.
+import numpy as np
+import pandas as pd
+
+# Имена столбцов из вашего скриншота
+COL_ID_DEAL = "Идентификатор сделки"
+COL_ID_INV = "Инвентарный номер"
+COL_ID_INV_KS = "Инвентарный номер КС"
+COL_BYN = "Цена в бел. руб."
+COL_DATE = "Дата сделки"
+COL_TYPE = "Тип недвижимого имущества"
+COL_AREA = "Общая площадь, кв.м"
+COL_ADRESS = "Адрес"
+
+# Нормализуем типы
+TYPE_ISO = "изолированное помещение"
+TYPE_KS  = "капитальное строение"
+
+# --- Подготовка ключа "одно и то же капитальное строение" ---
+# Для КС ключ = его инв. номер; для ИП ключ = "Инв. номер КС"
+ks_key = np.where(
+    total_df[COL_TYPE].str.lower().eq(TYPE_KS),
+    total_df[COL_ID_INV],
+    total_df[COL_ID_INV_KS]
+)
+total_df["_KS_KEY"] = ks_key
+
+# Группировка по условиям правил: одинаковая цена, одинаковая дата, одно и то же КС
+grp_cols = [COL_BYN, COL_DATE, "_KS_KEY"]
+
+# Признак наличия в группе и КС, и ИП
+has_ks  = total_df[COL_TYPE].str.lower().eq(TYPE_KS).groupby(total_df[grp_cols].agg(tuple)).transform("any").values
+has_iso = total_df[COL_TYPE].str.lower().eq(TYPE_ISO).groupby(total_df[grp_cols].agg(tuple)).transform("any").values
+both_types = has_ks & has_iso
+
+# Число разных ID сделки в группе (для различения правил)
+id_deal_nu = total_df.groupby(grp_cols)[COL_ID_DEAL].transform("nunique")
+
+# Стоимость КС и площадь КС внутри группы (берём первую строку КС)
+ks_cost  = total_df[COL_BYN].where(total_df[COL_TYPE].str.lower().eq(TYPE_KS))
+ks_area  = total_df[COL_AREA].where(total_df[COL_TYPE].str.lower().eq(TYPE_KS))
+ks_cost_g = ks_cost.groupby(total_df[grp_cols].agg(tuple)).transform("first")
+ks_area_g = ks_area.groupby(total_df[grp_cols].agg(tuple)).transform("first")
+
+# Цена за 1 м² по КС
+price_per_m2 = ks_cost_g / ks_area_g
+
+# Условия общего срабатывания (есть обе типологии и КС найдено)
+common_ok = both_types & ks_area_g.notna() & ks_cost_g.notna()
+
+# Разделение правил
+cond_orange = common_ok & (id_deal_nu > 1)   # Q разные
+cond_red    = common_ok & (id_deal_nu == 1)  # Q одинаковые
+
+# Маска строк ИП (пересчитываем только их стоимость)
+is_iso = total_df[COL_TYPE].str.lower().eq(TYPE_ISO)
+
+# Новый расчёт стоимости ИП = (цена за 1 м² КС) * площадь ИП
+new_cost = (price_per_m2 * total_df[COL_AREA]).round(2)
+
+# Применяем пересчёт по оранжевому правилу
+mask_orange_apply = is_iso & cond_orange
+total_df.loc[mask_orange_apply, COL_BYN] = new_cost[mask_orange_apply]
+
+# Применяем пересчёт по красному правилу
+mask_red_apply = is_iso & cond_red
+total_df.loc[mask_red_apply, COL_BYN] = new_cost[mask_red_apply]
+
+# Флаг rules_7: помечаем строки ИП, где правило сработало (укажем конкретный цвет правила)
+total_df["rules_7"] = np.select(
+    [mask_orange_apply, mask_red_apply],
+    ["orange", "red"],
+    default=""
+)
+
+# Можно подчистить служебный столбец
+total_df.drop(columns=["_KS_KEY"], inplace=True)

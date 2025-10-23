@@ -1,163 +1,59 @@
-total_df_merged = pd.read_excel("./data/total_df_with_curr.xlsx")
-total_df = total_df_merged.copy()
-total_df.shape
-COL_ID_DEAL = "Идентификатор сделки"
-COL_ID_INV = "Инвентарный номер"
-COL_ID_INV_KS = "Инвентарный номер КС"
-COL_BYN = "Цена в бел. руб."
-COL_DATE = "Дата сделки"
-COL_TYPE = "Тип недвижимого имущества"
-COL_AREA = "Общая площадь, кв.м"
-COL_ADRESS = "Адрес"
-total_df[COL_BYN] = total_df[COL_BYN].round(2)
+category_groups = {
+    'офис': ['офис'],
+    'торговля': ['торговля'],
+    'прочее': []  # все остальные категории
+}
 
-TYPE_ISO = "изолированное помещение"
-TYPE_KS = "капитальное строение"
-total_df[COL_TYPE] = total_df[COL_TYPE].astype(str).str.strip().str.lower()
-total_df["rules_7"] = ""
-total_df["_KS_KEY"] = np.where(
-    total_df[COL_TYPE].eq(TYPE_KS),
-    total_df[COL_ID_INV].astype(str),
-    total_df[COL_ID_INV_KS].astype(str),
-)
-key_cols = [COL_BYN, COL_DATE, "_KS_KEY"]
-combos = (
-    total_df[key_cols]
-    .dropna(subset=[COL_BYN, COL_DATE, "_KS_KEY"])
-    .drop_duplicates()
-    .itertuples(index=False, name=None)
-)
-for price, dt, kskey in combos:
-    m = (
-        (total_df[COL_BYN].eq(price))
-        & (total_df[COL_DATE].eq(dt))
-        & (total_df["_KS_KEY"].astype(str).eq(str(kskey)))
-    )
-    grp = total_df.loc[m]
+# Функция для выбора группы
+def get_group(cat):
+    if cat in category_groups['офис']:
+        return 'офис'
+    elif cat in category_groups['торговля']:
+        return 'торговля'
+    else:
+        return 'прочее'
 
-    # В группе должны быть ИП и КС
-    if not (
-        grp[COL_TYPE].eq(TYPE_ISO).any() and grp[COL_TYPE].eq(TYPE_KS).any()
-    ):
-        continue
+# Добавляем группировку
+X_train['cat_group'] = X_train['category'].apply(get_group)
+X_valid['cat_group'] = X_valid['category'].apply(get_group)
 
-    # Проверка "одно и то же капитальное строение" выполнена самим kskey,
-    # но дополнительно убедимся, что у КС один инв. номер
-    ks_rows = grp[grp[COL_TYPE].eq(TYPE_KS)]
-    if ks_rows.empty:
-        continue
+# Для хранения результатов
+X_train['cluster_price'] = np.nan
+X_valid['cluster_price'] = np.nan
 
-    ks_inv_unique = ks_rows[COL_ID_INV].astype(str).nunique()
-    if ks_inv_unique != 1:
-        # неоднозначный КС — пропускаем
-        continue
+# ---------- Обучение отдельно по каждой группе ----------
+for group_name, group_df in X_train.groupby('cat_group'):
+    print(f"Обучение для группы: {group_name}")
 
-    # Доп. проверка: у строк ИП столбец C (Инв. номер КС) должен совпадать с AE
-    # (т.е. самосогласованность ссылки)
-    iso_rows = grp[grp[COL_TYPE].eq(TYPE_ISO)]
-    if not iso_rows.empty:
-        same_link = iso_rows[COL_ID_INV_KS].astype(str) == iso_rows[
-            COL_ID_INV_KS
-        ].astype(
-            str
-        )  # формально true
-        # Если хотите жёстко — раскомментируйте сравнение с фактическим КС:
-        # same_link = iso_rows[COL_ID_INV_KS].astype(str).eq(ks_rows[COL_ID_INV].astype(str).iloc[0])
-        if not same_link.all():
-            continue
+    # Фильтруем train/valid
+    train_part = X_train[X_train['cat_group'] == group_name]
+    valid_part = X_valid[X_valid['cat_group'] == group_name]
 
-    # Цена за 1 м² КС = стоимость/площадь (берём из строки(строк) КС)
-    ks_area = pd.to_numeric(ks_rows[COL_AREA], errors="coerce")
-    ks_cost = pd.to_numeric(ks_rows[COL_BYN], errors="coerce")
+    # Подготовка признаков (lat, lon)
+    X_train_kmeans = train_part[['latitude', 'longitude']].reset_index(drop=True)
+    X_valid_kmeans = valid_part[['latitude', 'longitude']].reset_index(drop=True)
 
-    if ks_area.isna().all() or ks_cost.isna().all():
-        continue
-    # Берём первую валидную пару площадь/стоимость
-    valid_idx = (ks_area > 0) & ks_cost.notna()
-    if not valid_idx.any():
-        continue
+    # Оптимальное число кластеров можно подбирать отдельно, но пусть 30:
+    kmeans = KMeans(n_clusters=30, random_state=42, n_init=10)
+    kmeans.fit(X_train_kmeans)
 
-    p_m2 = ks_cost[valid_idx].iloc[0] / ks_area[valid_idx].iloc[0]
+    # Присваиваем кластеры
+    X_train.loc[train_part.index, 'cluster_price'] = kmeans.labels_
+    X_valid.loc[valid_part.index, 'cluster_price'] = kmeans.predict(X_valid_kmeans)
 
-    # Определяем какое правило: оранжевое (разные Q) или красное (одинаковые Q)
-    id_nu = grp[COL_ID_DEAL].astype(str).nunique()
-    rule_flag = "orange" if id_nu > 1 else "red"
+    # ---------- Оценка качества ----------
+    if len(valid_part) > 2 and len(valid_part['latitude'].unique()) > 1:
+        sil_score = silhouette_score(X_valid_kmeans, X_valid.loc[valid_part.index, 'cluster_price'])
+        print(f"Silhouette для {group_name}: {sil_score:.3f}")
+    else:
+        sil_score = np.nan
+        print(f"Недостаточно данных для оценки {group_name}")
 
-    # Пересчитываем стоимость только для ИП в группе
-    idx_apply = total_df.index[m & total_df[COL_TYPE].eq(TYPE_ISO)]
-    if len(idx_apply) == 0:
-        continue
+    if sil_score > 0.3:
+        print("✅ Good clustering")
+    else:
+        print("⚠️ Weak structure")
 
-    new_vals = (p_m2 * total_df.loc[idx_apply, COL_AREA]).round(2)
-    total_df.loc[idx_apply, COL_BYN] = new_vals.values
-    total_df.loc[idx_apply, "rules_7"] = rule_flag
-total_df.loc[
-    total_df[COL_TYPE].str.lower().eq("капитальное строение"), "rules_7"
-] = total_df.groupby("_KS_KEY")["rules_7"].transform(
-    lambda s: s[s.ne("")].iloc[0] if (s != "").any() else ""
-)
-total_df["Цена в долларах США"] = (
-    total_df["Цена в бел. руб."] / total_df["1 Доллар США (USD)"]
-)
-total_df["Цена в евро"] = (
-    total_df["Цена в бел. руб."] / total_df["1 Евро (EUR)"]
-)
-# Цена за площадь
-total_df["Цена в бел. руб. за кв.м"] = (
-    total_df["Цена в бел. руб."] / total_df["Общая площадь, кв.м"]
-)
-total_df["Цена в долларах США за кв.м"] = (
-    total_df["Цена в долларах США"] / total_df["Общая площадь, кв.м"]
-)
-total_df["Цена в евро за кв.м"] = (
-    total_df["Цена в евро"] / total_df["Общая площадь, кв.м"]
-)
-total_df[
-    (total_df["Адрес"].str.contains("Купревич"))
-    & (total_df[COL_DATE] == "2020-01-04")
-][
-    [
-        COL_ID_DEAL,
-        COL_TYPE,
-        COL_DATE,
-        COL_BYN,
-        COL_AREA,
-        "Цена в бел. руб. за кв.м",
-        "rules_7",
-        COL_ID_INV_KS,
-    ]
-]
-a = 529116.74 / 745.7
-a * np.array([9, 10.9, 14, 14.7, 15.3, 21, 62.5])
-вродек ок
-
-total_df[total_df["Идентификатор сделки"] == "68374212-комплекс"][
-    [
-        COL_ID_DEAL,
-        COL_TYPE,
-        COL_DATE,
-        COL_BYN,
-        COL_AREA,
-        "Цена в бел. руб. за кв.м",
-        "rules_7",
-    ]
-]
-a = 1004679.00 / 341
-a * np.array(
-    [11.2, 11.4, 11.4, 13, 17.4, 17.8, 18.2, 18.8, 18.8, 19.6, 22.8, 28.2, 30.2]
-)
-total_df[total_df["Идентификатор сделки"] == "64234535-комплекс"][
-    [
-        COL_ID_DEAL,
-        COL_TYPE,
-        COL_DATE,
-        COL_BYN,
-        COL_AREA,
-        "Цена в бел. руб. за кв.м",
-        "rules_7",
-    ]
-]
-total_df["rules_7"].value_counts()
-total_df.drop(columns=["_KS_KEY"]).to_excel(
-    "./data/total_df_with_curr_and_filters.xlsx", index=False
-)
+# Результаты
+print(X_train[['category', 'cluster_price']].head())
+print(X_valid[['category', 'cluster_price']].head())

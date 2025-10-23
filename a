@@ -1,8 +1,3 @@
-# Средняя цена по кластерам на обучении
-geo_avg_map = X_train.groupby("minsk_geo_cluster_price")[TARGET].mean()
-
-# Добавляем в train
-X_train["geo_avg_target"] = X_train["minsk_geo_cluster_price"].map(geo_avg_map)
-
-# И применяем ту же статистику к valid
-X_valid["geo_avg_target"] = X_valid["minsk_geo_cluster_price"].map(geo_avg_map)
+geo_stats = X_train.groupby("minsk_geo_cluster_price")[TARGET].agg(["mean", "median", "min", "max", "std"])
+X_train = X_train.merge(geo_stats, on="minsk_geo_cluster_price", suffixes=("", "_geo"))
+X_valid = X_valid.merge(geo_stats, on="minsk_geo_cluster_price", suffixes=("", "_geo"))

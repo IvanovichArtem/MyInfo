@@ -1,3 +1,28 @@
-geo_stats = X_train.groupby("minsk_geo_cluster_price")[TARGET].agg(["mean", "median", "min", "max", "std"])
-X_train = X_train.merge(geo_stats, on="minsk_geo_cluster_price", suffixes=("", "_geo"))
-X_valid = X_valid.merge(geo_stats, on="minsk_geo_cluster_price", suffixes=("", "_geo"))
+from mgwr.gwr import GWR
+
+# coords_train — координаты train
+# coords_valid — координаты valid
+coords_train = X_train[["longitude", "latitude"]].values
+coords_valid = X_valid[["longitude", "latitude"]].values
+
+# признаки и таргет (так же, как при обучении)
+X_train_gwr = X_train[["area", "rooms"]].values
+X_valid_gwr = X_valid[["area", "rooms"]].values
+y_train_gwr = np.log1p(X_train["TARGET"].values).reshape(-1, 1)
+
+# обучаем GWR (уже с найденным bandwidth)
+gwr_model = GWR(coords_train, y_train_gwr, X_train_gwr, bw)
+gwr_results = gwr_model.fit()
+
+# предсказания на валидации
+gwr_pred = gwr_model.predict(coords_valid, X_valid_gwr)
+y_valid_pred_log = gwr_pred.predictions.flatten()
+y_valid_pred = np.expm1(y_valid_pred_log)
+
+# метрики
+from sklearn.metrics import mean_absolute_error, r2_score
+mae = mean_absolute_error(X_valid["TARGET"], y_valid_pred)
+r2 = r2_score(X_valid["TARGET"], y_valid_pred)
+
+print(f"Validation MAE: {mae:.2f}")
+print(f"Validation R²: {r2:.3f}")

@@ -1,59 +1,23 @@
-category_groups = {
-    'офис': ['офис'],
-    'торговля': ['торговля'],
-    'прочее': []  # все остальные категории
-}
+X_train[TARGET] = y_train
 
-# Функция для выбора группы
-def get_group(cat):
-    if cat in category_groups['офис']:
-        return 'офис'
-    elif cat in category_groups['торговля']:
-        return 'торговля'
-    else:
-        return 'прочее'
+# Инициализация
+X_train["geo_avg_target"] = np.nan
 
-# Добавляем группировку
-X_train['cat_group'] = X_train['category'].apply(get_group)
-X_valid['cat_group'] = X_valid['category'].apply(get_group)
+# KFold разбиение
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-# Для хранения результатов
-X_train['cluster_price'] = np.nan
-X_valid['cluster_price'] = np.nan
+for train_idx, val_idx in kf.split(X_train):
+    df_train = X_train.iloc[train_idx]
+    df_val   = X_train.iloc[val_idx]
 
-# ---------- Обучение отдельно по каждой группе ----------
-for group_name, group_df in X_train.groupby('cat_group'):
-    print(f"Обучение для группы: {group_name}")
+    # Средняя цена по кластерам (на train-фолде)
+    avg = df_train.groupby("minsk_geo_cluster_price")[TARGET].mean()
 
-    # Фильтруем train/valid
-    train_part = X_train[X_train['cat_group'] == group_name]
-    valid_part = X_valid[X_valid['cat_group'] == group_name]
+    # Заполняем значения на валидационном фолде
+    X_train.loc[val_idx, "geo_avg_target"] = (
+        X_train.loc[val_idx, "minsk_geo_cluster_price"].map(avg)
+    )
 
-    # Подготовка признаков (lat, lon)
-    X_train_kmeans = train_part[['latitude', 'longitude']].reset_index(drop=True)
-    X_valid_kmeans = valid_part[['latitude', 'longitude']].reset_index(drop=True)
-
-    # Оптимальное число кластеров можно подбирать отдельно, но пусть 30:
-    kmeans = KMeans(n_clusters=30, random_state=42, n_init=10)
-    kmeans.fit(X_train_kmeans)
-
-    # Присваиваем кластеры
-    X_train.loc[train_part.index, 'cluster_price'] = kmeans.labels_
-    X_valid.loc[valid_part.index, 'cluster_price'] = kmeans.predict(X_valid_kmeans)
-
-    # ---------- Оценка качества ----------
-    if len(valid_part) > 2 and len(valid_part['latitude'].unique()) > 1:
-        sil_score = silhouette_score(X_valid_kmeans, X_valid.loc[valid_part.index, 'cluster_price'])
-        print(f"Silhouette для {group_name}: {sil_score:.3f}")
-    else:
-        sil_score = np.nan
-        print(f"Недостаточно данных для оценки {group_name}")
-
-    if sil_score > 0.3:
-        print("✅ Good clustering")
-    else:
-        print("⚠️ Weak structure")
-
-# Результаты
-print(X_train[['category', 'cluster_price']].head())
-print(X_valid[['category', 'cluster_price']].head())
+# Для валидационного набора (вне фолдов)
+geo_avg_map = X_train.groupby("minsk_geo_cluster_price")["geo_avg_target"].mean()
+X_valid["geo_avg_target"] = X_valid["minsk_geo_cluster_price"].map(geo_avg_map)

@@ -1,23 +1,8 @@
-X_train[TARGET] = y_train
+# Средняя цена по кластерам на обучении
+geo_avg_map = X_train.groupby("minsk_geo_cluster_price")[TARGET].mean()
 
-# Инициализация
-X_train["geo_avg_target"] = np.nan
+# Добавляем в train
+X_train["geo_avg_target"] = X_train["minsk_geo_cluster_price"].map(geo_avg_map)
 
-# KFold разбиение
-kf = KFold(n_splits=5, shuffle=True, random_state=42)
-
-for train_idx, val_idx in kf.split(X_train):
-    df_train = X_train.iloc[train_idx]
-    df_val   = X_train.iloc[val_idx]
-
-    # Средняя цена по кластерам (на train-фолде)
-    avg = df_train.groupby("minsk_geo_cluster_price")[TARGET].mean()
-
-    # Заполняем значения на валидационном фолде
-    X_train.loc[val_idx, "geo_avg_target"] = (
-        X_train.loc[val_idx, "minsk_geo_cluster_price"].map(avg)
-    )
-
-# Для валидационного набора (вне фолдов)
-geo_avg_map = X_train.groupby("minsk_geo_cluster_price")["geo_avg_target"].mean()
+# И применяем ту же статистику к valid
 X_valid["geo_avg_target"] = X_valid["minsk_geo_cluster_price"].map(geo_avg_map)

@@ -1,28 +1,56 @@
-from mgwr.gwr import GWR
+data = {
+    "period": [
+        "Январь 2020", "Апрель 2020", "Июль 2020", "Октябрь 2020",
+        "Январь 2021", "Апрель 2021", "Июль 2021", "Октябрь 2021",
+        "Январь 2022", "Апрель 2022", "Июль 2022", "Октябрь 2022",
+        "Январь 2023", "Апрель 2023", "Июль 2023", "Октябрь 2023",
+        "Январь 2024", "Апрель 2024", "Июль 2024", "Октябрь 2024",
+        "Январь 2025", "Апрель 2025", "Июль 2025", "Октябрь 2025",
+    ],
+    "торговля": [
+        1270, 1170, 1150, 1090, 1100, 1260, 1260, 1250, 1240, 1230, 1250, 1230,
+        1240, 1320, 1330, 1310, 1320, 1380, 1360, 1380, 1370, 1400, 1450
+    ],
+    "административное": [
+        1255, 1225, 1150, 1155, 1165, 1150, 1145, 1145, 1145, 1075, 1060, 1090,
+        535, 1115, 1130, 1100, 1120, 1155, 1135, 1150, 1155, 1155, 1160
+    ],
+    "склад+производство": [
+        340, None, 320, None, 300, None, 290, None, 290, None, 290, None,
+        290, None, 300, None, 320, None, 320, None, 320, None, 320
+    ]
+}
 
-# coords_train — координаты train
-# coords_valid — координаты valid
-coords_train = X_train[["longitude", "latitude"]].values
-coords_valid = X_valid[["longitude", "latitude"]].values
+df_trend = pd.DataFrame(data)
 
-# признаки и таргет (так же, как при обучении)
-X_train_gwr = X_train[["area", "rooms"]].values
-X_valid_gwr = X_valid[["area", "rooms"]].values
-y_train_gwr = np.log1p(X_train["TARGET"].values).reshape(-1, 1)
+month_map = {
+    'Январь': 1, 'Февраль': 2, 'Март': 3, 'Апрель': 4,
+    'Май': 5, 'Июнь': 6, 'Июль': 7, 'Август': 8,
+    'Сентябрь': 9, 'Октябрь': 10, 'Ноябрь': 11, 'Декабрь': 12
+}
 
-# обучаем GWR (уже с найденным bandwidth)
-gwr_model = GWR(coords_train, y_train_gwr, X_train_gwr, bw)
-gwr_results = gwr_model.fit()
+def parse_period(s):
+    month_name, year = s.split()
+    return pd.Timestamp(year=int(year), month=month_map[month_name], day=1)
 
-# предсказания на валидации
-gwr_pred = gwr_model.predict(coords_valid, X_valid_gwr)
-y_valid_pred_log = gwr_pred.predictions.flatten()
-y_valid_pred = np.expm1(y_valid_pred_log)
+df_trend['deal_date'] = df_trend['period'].apply(parse_period)
+df_trend['Quarter'] = df_trend['deal_date'].dt.to_period('Q')
+df_trend.drop(columns=['period'], inplace=True)
 
-# метрики
-from sklearn.metrics import mean_absolute_error, r2_score
-mae = mean_absolute_error(X_valid["TARGET"], y_valid_pred)
-r2 = r2_score(X_valid["TARGET"], y_valid_pred)
+def compute_trend(series):
+    y = series.dropna().values
+    if len(y) < 3:
+        return 0.0
+    x = np.arange(len(y)).reshape(-1, 1)
+    model = LinearRegression().fit(x, y)
+    return float(model.coef_[0])
 
-print(f"Validation MAE: {mae:.2f}")
-print(f"Validation R²: {r2:.3f}")
+trend_features = {}
+for col in ['торговля', 'административное', 'склад+производство']:
+    trend_features[col] = compute_trend(df_trend[col])
+
+trend_df = (
+    pd.DataFrame.from_dict(trend_features, orient='index', columns=['trend_category'])
+    .reset_index()
+    .rename(columns={'index': 'category_mapped'})
+)

@@ -1,24 +1,7 @@
-import numpy as np
-
-# гиперпараметры из методики: бакет -> (p, h, ядро)
-PARAMS = {1: (63, 19, "Gaussian"),  2: (79, 26, "Truncated"),   3: (85, 25, "Truncated"),
-          4: (81, 18, "Truncated"), 5: (80, 19, "Gaussian"),    6: (83, 33, "Epanechnikov"),
-          7: (85, 19, "Gaussian"),  8: (88, 18, "Truncated"),   9: (90, 39, "Truncated"),
-          10: (94, 4, "Epanechnikov"), 11: (94, 3, "Truncated"), 12: (97, 6, "Epanechnikov")}
-
-def nw_level(s, h, kernel):
-    """Шаг 1: backward-looking Надарая–Уотсон = взвешенное среднее за последние h дней."""
-    u = -np.arange(h) / h                              # 0 = сегодня, ... старые дни
-    w = {"Truncated": np.ones(h),
-         "Epanechnikov": 1 - u**2,
-         "Gaussian": np.exp(-0.5 * u**2)}[kernel]
-    return s.rolling(h).apply(lambda x: (x * w[::-1]).sum() / w.sum(), raw=True)
-
-p, h, kernel = PARAMS[1]
-tab = s.to_frame()
-tab["E"] = nw_level(s, h, kernel)                                        # шаг 1
-tab["regime"] = np.where(tab["E"].isna(), np.nan,
-                         np.where(tab["Amount"] >= tab["E"], "high", "low"))  # шаг 2
-
-print(tab["regime"].value_counts(dropna=False))
-tab.tail(10)
+part = tab.last("120D")
+fig, ax = plt.subplots(figsize=(14, 4))
+ax.plot(part["Amount"], color="k", lw=1, label="Amount")
+ax.plot(part["E"], color="tab:blue", lw=1.5, label=f"E (h={h}, {kernel})")
+hi = part["regime"] == "high"
+ax.scatter(part.index[hi], part["Amount"][hi], color="tab:red", s=12, label="high", zorder=3)
+ax.legend(); ax.set_title("Шаги 1–2 на бакете 1M"); plt.show()

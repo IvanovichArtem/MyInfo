@@ -1,7 +1,36 @@
-part = tab.last("120D")
-fig, ax = plt.subplots(figsize=(14, 4))
-ax.plot(part["Amount"], color="k", lw=1, label="Amount")
-ax.plot(part["E"], color="tab:blue", lw=1.5, label=f"E (h={h}, {kernel})")
-hi = part["regime"] == "high"
-ax.scatter(part.index[hi], part["Amount"][hi], color="tab:red", s=12, label="high", zorder=3)
-ax.legend(); ax.set_title("Шаги 1–2 на бакете 1M"); plt.show()
+BUCKETS = list(range(1, 13))
+TAU = {k: int(round(30.4 * k)) for k in BUCKETS}          # правая граница бакета в днях
+
+def max_outflow(s, tau):
+    """Шаг 3–4: (min(A_t..A_t+tau) - A_t) / A_t. NaN, если будущее ещё не наступило."""
+    fwd_min = s[::-1].rolling(tau + 1, min_periods=tau + 1).min()[::-1]
+    return fwd_min / s - 1
+
+dd = pd.DataFrame({k: max_outflow(s, TAU[k]) for k in BUCKETS}, index=s.index)
+
+print("Δ по бакетам, %:")
+(dd.describe(percentiles=[0.05, 0.5]).T[["count", "mean", "5%", "50%", "min"]]
+   .assign(**{c: lambda x, c=c: x[c] * 100 for c in ["mean", "5%", "50%", "min"]})
+   .round(2))
+
+
+regimes = pd.DataFrame(index=s.index)
+for k in BUCKETS:
+    p, h, kernel = PARAMS[k]
+    E = nw_level(s, h, kernel)
+    regimes[k] = (pd.Series(np.where(s >= E, "high", "low"), index=s.index)
+                    .where(E.notna()))
+
+print("Доля high-дней по бакетам:")
+(regimes == "high").mean().round(3).to_frame("доля high").T
+
+
+check = pd.DataFrame({
+    k: {"high": dd.loc[regimes[k] == "high", k].mean() * 100,
+        "low":  dd.loc[regimes[k] == "low",  k].mean() * 100,
+        "N high": (regimes[k] == "high")[dd[k].notna()].sum(),
+        "N low":  (regimes[k] == "low")[dd[k].notna()].sum()}
+    for k in BUCKETS}).T
+
+check["разница, п.п."] = check["high"] - check["low"]
+check.round(2)

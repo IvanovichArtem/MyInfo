@@ -1,15 +1,18 @@
-df = pd.concat([pd.read_csv(f, sep=";", dtype=str) for f in sorted(Path("./data").glob("*.csv"))],
-               ignore_index=True)
+import matplotlib.pyplot as plt
 
-df = df[df["ISO_4217_CURY_DESC"].str.strip() == "BYN"]
+fig, ax = plt.subplots(3, 1, figsize=(14, 10))
 
-df["REP_DT"] = pd.to_datetime(df["REP_DT"], format="%d.%m.%Y")
-df["OST_VAL"] = pd.to_numeric(df["OST_VAL"].str.replace(" ", "").str.replace(",", "."))
+ax[0].plot(s, lw=0.8)
+ax[0].set_title("Остаток ФЛ BYN, млн")
 
-daily = (df.groupby(["REP_DT", "GROU4_OF_COA"], as_index=False)["OST_VAL"].sum()
-           .sort_values(["GROU4_OF_COA", "REP_DT"])
-           .reset_index(drop=True))
+last = s.last("120D")
+ax[1].plot(last, lw=1.2, marker=".")
+ax[1].set_title("Последние 120 дней")
 
-print(daily.shape)
-print(daily["GROU4_OF_COA"].unique())
-daily.head()
+# средний профиль по дню месяца: отклонение от среднего за месяц, %
+dev = (s / s.groupby(s.index.to_period("M")).transform("mean") - 1) * 100
+dev.groupby(dev.index.day).mean().plot.bar(ax=ax[2])
+ax[2].set_title("Средний профиль внутри месяца: отклонение от среднего за месяц, %")
+ax[2].set_xlabel("день месяца")
+
+plt.tight_layout(); plt.show()

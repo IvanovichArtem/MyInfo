@@ -1,58 +1,15 @@
-from pathlib import Path
-import numpy as np
-import pandas as pd
+df = pd.concat([pd.read_csv(f, sep=";", dtype=str) for f in sorted(Path("./data").glob("*.csv"))],
+               ignore_index=True)
 
-pd.set_option("display.width", 200)
-pd.set_option("display.max_columns", 50)
+df = df[df["ISO_4217_CURY_DESC"].str.strip() == "BYN"]
 
-DATA_DIR = Path("./data")
-SEP = ";"
+df["REP_DT"] = pd.to_datetime(df["REP_DT"], format="%d.%m.%Y")
+df["OST_VAL"] = pd.to_numeric(df["OST_VAL"].str.replace(" ", "").str.replace(",", "."))
 
-files = sorted(DATA_DIR.glob("*.csv"))
-print(f"Найдено файлов: {len(files)}")
-for f in files:
-    print(f"  {f.name:<40} {f.stat().st_size / 1024**2:8.2f} MB")
+daily = (df.groupby(["REP_DT", "GROU4_OF_COA"], as_index=False)["OST_VAL"].sum()
+           .sort_values(["GROU4_OF_COA", "REP_DT"])
+           .reset_index(drop=True))
 
-
-
-
-def read_raw(path, nrows=None):
-    """Читаем всё как строки; пробуем типичные кодировки банковских выгрузок."""
-    for enc in ("utf-8", "utf-8-sig", "cp1251"):
-        try:
-            return pd.read_csv(path, sep=SEP, dtype=str, nrows=nrows, encoding=enc), enc
-        except UnicodeDecodeError:
-            continue
-    raise ValueError(f"Не удалось подобрать кодировку для {path.name}")
-
-columns_by_file = {}
-for f in files:
-    df_head, enc = read_raw(f, nrows=5)
-    columns_by_file[f.name] = list(df_head.columns)
-    print(f"\n=== {f.name}  (кодировка: {enc}) ===")
-    print("Колонки:", list(df_head.columns))
-    display(df_head)
-
-# одинаковый ли набор колонок во всех файлах
-unique_schemas = {tuple(c) for c in columns_by_file.values()}
-print(f"\nРазных наборов колонок: {len(unique_schemas)}")
-if len(unique_schemas) > 1:
-    for name, cols in columns_by_file.items():
-        print(f"  {name}: {cols}")
-
-
-
-parts = []
-for f in files:
-    df_f, enc = read_raw(f)
-    df_f["SOURCE_FILE"] = f.name
-    parts.append(df_f)
-    print(f"{f.name:<40} строк: {len(df_f):>10,}")
-
-raw = pd.concat(parts, ignore_index=True)
-print(f"\nИтого строк: {len(raw):,}, колонок: {raw.shape[1]}")
-print(f"Память: {raw.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
-
-# пропуски по колонкам
-display(raw.isna().sum().to_frame("пропусков").assign(
-    доля=lambda x: (x["пропусков"] / len(raw)).round(4)))
+print(daily.shape)
+print(daily["GROU4_OF_COA"].unique())
+daily.head()

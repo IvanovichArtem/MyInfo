@@ -1,18 +1,24 @@
-import matplotlib.pyplot as plt
+import numpy as np
 
-fig, ax = plt.subplots(3, 1, figsize=(14, 10))
+# гиперпараметры из методики: бакет -> (p, h, ядро)
+PARAMS = {1: (63, 19, "Gaussian"),  2: (79, 26, "Truncated"),   3: (85, 25, "Truncated"),
+          4: (81, 18, "Truncated"), 5: (80, 19, "Gaussian"),    6: (83, 33, "Epanechnikov"),
+          7: (85, 19, "Gaussian"),  8: (88, 18, "Truncated"),   9: (90, 39, "Truncated"),
+          10: (94, 4, "Epanechnikov"), 11: (94, 3, "Truncated"), 12: (97, 6, "Epanechnikov")}
 
-ax[0].plot(s, lw=0.8)
-ax[0].set_title("Остаток ФЛ BYN, млн")
+def nw_level(s, h, kernel):
+    """Шаг 1: backward-looking Надарая–Уотсон = взвешенное среднее за последние h дней."""
+    u = -np.arange(h) / h                              # 0 = сегодня, ... старые дни
+    w = {"Truncated": np.ones(h),
+         "Epanechnikov": 1 - u**2,
+         "Gaussian": np.exp(-0.5 * u**2)}[kernel]
+    return s.rolling(h).apply(lambda x: (x * w[::-1]).sum() / w.sum(), raw=True)
 
-last = s.last("120D")
-ax[1].plot(last, lw=1.2, marker=".")
-ax[1].set_title("Последние 120 дней")
+p, h, kernel = PARAMS[1]
+tab = s.to_frame()
+tab["E"] = nw_level(s, h, kernel)                                        # шаг 1
+tab["regime"] = np.where(tab["E"].isna(), np.nan,
+                         np.where(tab["Amount"] >= tab["E"], "high", "low"))  # шаг 2
 
-# средний профиль по дню месяца: отклонение от среднего за месяц, %
-dev = (s / s.groupby(s.index.to_period("M")).transform("mean") - 1) * 100
-dev.groupby(dev.index.day).mean().plot.bar(ax=ax[2])
-ax[2].set_title("Средний профиль внутри месяца: отклонение от среднего за месяц, %")
-ax[2].set_xlabel("день месяца")
-
-plt.tight_layout(); plt.show()
+print(tab["regime"].value_counts(dropna=False))
+tab.tail(10)

@@ -1,36 +1,35 @@
-BUCKETS = list(range(1, 13))
-TAU = {k: int(round(30.4 * k)) for k in BUCKETS}          # правая граница бакета в днях
+def forecast_a(t0):
+    """Для каждого бакета: корзина того же режима, только t + tau <= t0, квантиль p."""
+    rows = []
+    for k in BUCKETS:
+        p, h, kernel = PARAMS[k]
+        regime_t0 = regimes.loc[t0, k]
+        hist_idx = dd.index[dd.index <= t0 - pd.Timedelta(days=TAU[k])]     # шаг 5: без утечки
+        basket = dd.loc[hist_idx, k][regimes.loc[hist_idx, k] == regime_t0].dropna()
+        a = np.quantile(basket, 1 - p / 100) if len(basket) else np.nan    # шаг 6
+        rows.append({"бакет": f"{k}M", "p": p, "режим t0": regime_t0,
+                     "N в корзине": len(basket), "a": a})
+    return pd.DataFrame(rows)
 
-def max_outflow(s, tau):
-    """Шаг 3–4: (min(A_t..A_t+tau) - A_t) / A_t. NaN, если будущее ещё не наступило."""
-    fwd_min = s[::-1].rolling(tau + 1, min_periods=tau + 1).min()[::-1]
-    return fwd_min / s - 1
-
-dd = pd.DataFrame({k: max_outflow(s, TAU[k]) for k in BUCKETS}, index=s.index)
-
-print("Δ по бакетам, %:")
-(dd.describe(percentiles=[0.05, 0.5]).T[["count", "mean", "5%", "50%", "min"]]
-   .assign(**{c: lambda x, c=c: x[c] * 100 for c in ["mean", "5%", "50%", "min"]})
-   .round(2))
-
-
-regimes = pd.DataFrame(index=s.index)
-for k in BUCKETS:
-    p, h, kernel = PARAMS[k]
-    E = nw_level(s, h, kernel)
-    regimes[k] = (pd.Series(np.where(s >= E, "high", "low"), index=s.index)
-                    .where(E.notna()))
-
-print("Доля high-дней по бакетам:")
-(regimes == "high").mean().round(3).to_frame("доля high").T
+t0 = s.index.max()
+fa = forecast_a(t0)
+fa.assign(**{"a, %": (fa["a"] * 100).round(2)}).drop(columns="a")
 
 
-check = pd.DataFrame({
-    k: {"high": dd.loc[regimes[k] == "high", k].mean() * 100,
-        "low":  dd.loc[regimes[k] == "low",  k].mean() * 100,
-        "N high": (regimes[k] == "high")[dd[k].notna()].sum(),
-        "N low":  (regimes[k] == "low")[dd[k].notna()].sum()}
-    for k in BUCKETS}).T
+def gap_table(fa, amount):
+    a = fa["a"].values
+    c = np.minimum.accumulate(np.minimum(a, 0))          # накопленный отток без «возвратов»
+    x = np.diff(np.r_[0, c])                             # отток внутри бакета
+    out = pd.DataFrame({"бакет": fa["бакет"],
+                        "a, %": (a * 100).round(2),
+                        "x, %": (x * 100).round(2),
+                        "V, млн": (x * amount).round(1),
+                        "остаток после, млн": (amount * (1 + c)).round(1)})
+    return out
 
-check["разница, п.п."] = check["high"] - check["low"]
-check.round(2)
+A0 = s.loc[t0]
+gaps = gap_table(fa, A0)
+print(f"Дата прогноза: {t0.date()},  остаток: {A0:,.1f} млн")
+print(f"Стабильная часть > 12M: {gaps['остаток после, млн'].iloc[-1]:,.1f} млн "
+      f"({gaps['остаток после, млн'].iloc[-1] / A0:.1%})")
+gaps

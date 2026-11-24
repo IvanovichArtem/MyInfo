@@ -1,263 +1,678 @@
-"""Дневная модель остатков и бэктест на последнем календарном годе.
-
-Вход: один ряд df с колонками date и amount, по одному остатку в день.
-Остатки неотрицательны, денежная единица произвольна. Нужны numpy и pandas.
-"""
-
-import numpy as np
-import pandas as pd
-
-
-AR_LAGS = (1, 7)
-DEFAULT_HORIZONS = (1, 7, 30, 90, 180, 365)
-MIN_HISTORY = max(AR_LAGS) + 3  # Две или более ошибки после построения лагов.
-
-
-def _prepare(df):
-    if not {"date", "amount"}.issubset(df.columns):
-        raise ValueError("В df нужны столбцы date и amount.")
-
-    dates = pd.to_datetime(df["date"], errors="raise").dt.tz_localize(None)
-    amounts = pd.to_numeric(df["amount"], errors="raise").to_numpy(dtype=float)
-    if dates.isna().any() or not np.isfinite(amounts).all() or (amounts < 0).any():
-        raise ValueError("Нужны даты без пропусков и конечные неотрицательные остатки.")
-
-    series = pd.Series(amounts, index=pd.DatetimeIndex(dates.dt.normalize(), name="date"))
-    series = series.sort_index()
-    if not series.index.is_unique:
-        raise ValueError("По каждому календарному дню нужен один остаток.")
-    if len(series) < MIN_HISTORY:
-        raise ValueError(f"Для оценки модели нужны минимум {MIN_HISTORY} дневных остатков.")
-    expected = pd.date_range(series.index[0], series.index[-1], freq="D", name="date")
-    if not series.index.equals(expected):
-        raise ValueError("В ряду есть пропущенные календарные дни. Проверьте историю.")
-    return series
-
-
-def _calendar_features(dates):
-    weekday = dates.dayofweek.to_numpy()
-    phase = 2 * np.pi * (dates.day.to_numpy() - 1) / dates.days_in_month.to_numpy()
-    month_end = dates.days_in_month.to_numpy() - dates.day.to_numpy() < 3
-    return np.column_stack((
-        weekday[:, None] == np.arange(6),
-        np.sin(phase), np.cos(phase), np.sin(2 * phase), np.cos(2 * phase),
-        month_end,
-    ))
-
-
-def _fit_arx(changes, dates):
-    positions = np.arange(max(AR_LAGS), len(changes))
-    target = changes[positions]
-    design = np.column_stack((
-        np.ones(len(positions)),
-        changes[positions[:, None] - np.array(AR_LAGS)],
-        _calendar_features(dates[positions]),
-    ))
-
-    # Ridge с единичным штрафом. Свободный член не штрафуется.
-    penalty = np.eye(design.shape[1])
-    penalty[0, 0] = 0
-    coefficients = np.linalg.lstsq(
-        np.vstack((design, penalty)),
-        np.concatenate((target, np.zeros(len(penalty)))),
-        rcond=None,
-    )[0]
-
-    # Достаточное условие устойчивости рекурсивной части.
-    ar = coefficients[1:1 + len(AR_LAGS)]
-    strength = np.abs(ar).sum()
-    if strength > 0.98:
-        ar *= 0.98 / strength
-        coefficients[0] += (target - design @ coefficients).mean()
-
-    residuals = target - design @ coefficients
-    return coefficients, residuals - residuals.mean()
-
-
-def _simulate(level, recent, volatility, date_effect, ar, innovations):
-    steps, n_paths = innovations.shape
-    lag_days = np.array(AR_LAGS)
-    history = np.broadcast_to(recent[:, None], (len(recent), n_paths)).copy()
-    current = np.full(n_paths, level)
-    paths = np.empty_like(innovations)
-
-    for step in range(steps):
-        lag_values = history[(step - lag_days) % len(recent)]
-        change = date_effect[step] + ar @ lag_values + innovations[step]
-        following = np.maximum(0.0, current + change * volatility)
-        history[step % len(recent)] = (following - current) / volatility
-        paths[step] = following
-        current = following
-    return paths
-
-
-def _forecast(history, dates, n_paths, q, rng):
-    balances = history.to_numpy()
-    start_amount = balances[-1]
-    positive_balances = balances[balances > 0]
-    scale = float(np.median(positive_balances)) if positive_balances.size else 1.0
-    levels = np.log1p(balances / scale)
-    changes = np.diff(levels)
-    volatility = float(changes.std()) or 1.0
-    changes /= volatility
-
-    coefficients, residuals = _fit_arx(changes, history.index[1:])
-    ar_end = 1 + len(AR_LAGS)
-    calendar = coefficients[0] + _calendar_features(dates) @ coefficients[ar_end:]
-    recent = changes[-max(AR_LAGS):]
-    models = (
-        ("arx", calendar, coefficients[1:ar_end], residuals),
-        ("naive", np.zeros(len(dates)), np.zeros(len(AR_LAGS)), changes - changes.mean()),
-    )
-
-    results = {}
-    for name, date_effect, ar, errors in models:
-        innovations = rng.choice(errors, size=(len(dates), n_paths))
-        paths = _simulate(levels[-1], recent, volatility, date_effect, ar, innovations)
-        paths = scale * np.expm1(paths)
-        drawdowns = np.maximum.accumulate(np.maximum(start_amount - paths, 0.0), axis=0)
-        lower, median, upper = np.quantile(paths, (1 - q, 0.5, q), axis=1)
-        drawdown_q = np.quantile(drawdowns, q, axis=1)
-        results[name] = pd.DataFrame({
-            "origin_date": history.index[-1],
-            "date": dates,
-            "model": name,
-            "horizon_days": np.arange(1, len(dates) + 1),
-            "start_amount": start_amount,
-            "forecast_amount": median if name == "arx" else start_amount,
-            "amount_lower": lower,
-            "amount_upper": upper,
-            "forecast_max_drawdown_q": drawdown_q,
-            "forecast_min_amount": start_amount - drawdown_q,
-        })
-    return pd.concat(results.values(), ignore_index=True)
-
-
-def _positive_integer(value):
-    return isinstance(value, (int, np.integer)) and not isinstance(value, bool) and value > 0
-
-
-def _check_simulation(n_paths, q):
-    if not _positive_integer(n_paths) or n_paths < 2:
-        raise ValueError("n_paths должно быть целым числом от 2.")
-    if not 0.5 < q < 1:
-        raise ValueError("q должен быть между 0.5 и 1, например 0.9.")
-
-
-def forecast_ump(df, *, days=365, n_paths=1000, q=0.90, seed=42):
-    """Прогноз после последней даты ряда, одна строка на модель и день вперёд."""
-    _check_simulation(n_paths, q)
-    if not _positive_integer(days):
-        raise ValueError("days должно быть положительным целым числом.")
-    series = _prepare(df)
-    dates = pd.date_range(series.index[-1] + pd.Timedelta(days=1), periods=days, freq="D")
-    return _forecast(series, dates, n_paths, q, np.random.default_rng(seed))
-
-
-def _with_actual(forecast, actual):
-    horizon_indices = forecast["horizon_days"].to_numpy() - 1
-    actual_at_horizon = actual[horizon_indices]
-    start = forecast["start_amount"].to_numpy()
-    actual_drawdown = np.maximum(start - np.minimum.accumulate(actual)[horizon_indices], 0.0)
-    return forecast.assign(actual_amount=actual_at_horizon, actual_max_drawdown=actual_drawdown)
-
-
-def _level_metrics(rows, mase_scale):
-    actual = rows["actual_amount"].to_numpy()
-    predicted = rows["forecast_amount"].to_numpy()
-    error = predicted - actual
-    absolute_error = np.abs(error)
-    smape = np.divide(2 * absolute_error, actual + predicted, out=np.zeros_like(error),
-                      where=actual + predicted > 0)
-    within_interval = (
-        (rows["actual_amount"] >= rows["amount_lower"])
-        & (rows["actual_amount"] <= rows["amount_upper"])
-    )
-    return {
-        "n": len(rows),
-        "mae": absolute_error.mean(),
-        "rmse": np.sqrt(np.mean(error ** 2)),
-        "smape_pct": 100 * smape.mean(),
-        "mase": absolute_error.mean() / mase_scale if mase_scale else np.nan,
-        "bias": error.mean(),
-        "balance_interval_coverage_pct": 100 * within_interval.mean(),
-    }
-
-
-def _drawdown_errors(rows, q):
-    error = rows["actual_max_drawdown"] - rows["forecast_max_drawdown_q"]
-    excess = error.clip(lower=0)
-    return rows.assign(
-        drawdown_pinball=np.where(error >= 0, q * error, (q - 1) * error),
-        drawdown_exceeded=error > 0,
-        drawdown_excess=excess,
-    )
-
-
-def backtest_ump(df, *, horizons=DEFAULT_HORIZONS, stride=7, n_paths=1000, q=0.90, seed=42):
-    """Вернуть фиксированный прогноз на год и метрики rolling-origin по горизонтам.
-
-    Последний календарный год служит тестом. Фиксированный прогноз использует
-    только историю до начала теста. Rolling-origin добавляет на каждой дате
-    только уже наблюдавшиеся остатки. Горизонты измеряются в календарных днях.
-    """
-    _check_simulation(n_paths, q)
-    horizons = tuple(horizons)
-    if not _positive_integer(stride) or not horizons or not all(map(_positive_integer, horizons)):
-        raise ValueError("stride и каждый из horizons должны быть положительными целыми числами.")
-
-    series = _prepare(df)
-    cutoff = series.index[-1] - pd.DateOffset(years=1)
-    train_size = series.index.searchsorted(cutoff, side="right")
-    if train_size < MIN_HISTORY:
-        raise ValueError(f"До последнего календарного года нужны минимум {MIN_HISTORY} наблюдений.")
-
-    train = series.iloc[:train_size]
-    test = series.iloc[train_size:]
-    selected = sorted({h for h in horizons if h <= len(test)})
-    if not selected:
-        raise ValueError("Ни один из заданных горизонтов не помещается в тестовый год.")
-
-    mase_scale = np.abs(np.diff(train.to_numpy())).mean()
-    rng = np.random.default_rng(seed)
-    annual = _forecast(train, test.index, n_paths, q, rng)
-    annual = _drawdown_errors(_with_actual(annual, test.to_numpy()), q)
-
-    rolling = [annual.loc[annual["horizon_days"].isin(selected)]]
-    for offset in range(stride, len(test) - selected[0] + 1, stride):
-        available = [h for h in selected if h <= len(test) - offset]
-        origin = train_size + offset
-        future = series.iloc[origin:origin + max(available)]
-        forecast = _forecast(series.iloc[:origin], future.index, n_paths, q, rng)
-        rows = forecast.loc[forecast["horizon_days"].isin(available)]
-        rolling.append(_drawdown_errors(_with_actual(rows, future.to_numpy()), q))
-
-    rolling = pd.concat(rolling, ignore_index=True)
-    horizon_metrics = []
-    for (model, horizon), rows in rolling.groupby(["model", "horizon_days"], sort=True):
-        horizon_metrics.append({
-            "model": model,
-            "horizon_days": horizon,
-            **_level_metrics(rows, mase_scale),
-            "drawdown_q": q,
-            "drawdown_pinball": rows["drawdown_pinball"].mean(),
-            "drawdown_breach_pct": 100 * rows["drawdown_exceeded"].mean(),
-            "mean_drawdown_excess": rows["drawdown_excess"].mean(),
-        })
-
-    annual_drawdown_cols = [
-        "model", "origin_date", "date", "horizon_days", "start_amount", "actual_max_drawdown",
-        "forecast_max_drawdown_q", "forecast_min_amount", "drawdown_pinball", "drawdown_exceeded",
-        "drawdown_excess",
-    ]
-    return {
-        "annual_forecast": annual,
-        "annual_metrics": pd.DataFrame([
-            {"model": model, **_level_metrics(rows, mase_scale)}
-            for model, rows in annual.groupby("model", sort=True)
-        ]),
-        "annual_drawdown": annual.loc[annual["horizon_days"].eq(len(test)), annual_drawdown_cols]
-            .reset_index(drop=True),
-        "rolling_forecast": rolling,
-        "rolling_metrics": pd.DataFrame(horizon_metrics),
-    }
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "forecast-01",
+   "metadata": {},
+   "source": [
+    "# Прогноз остатков физлиц в BYN\n",
+    "\n",
+    "Вход — готовый pandas DataFrame `df` с колонками `date` и `amount` в BYN. Подготовьте его в ядре перед запуском. Для расчётов нужны pandas и NumPy, для графиков — matplotlib. Суммы на графиках показаны в млн BYN.\n",
+    "\n",
+    "Тест — последние шесть календарных месяцев. Предшествующие три месяца по умолчанию используются для выбора модели. При выборе приоритет у первых 30 дней. После теста выбранная модель строит прогноз на год от последнего факта."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-02",
+   "metadata": {},
+   "source": [
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "\n",
+    "try:\n",
+    "    import matplotlib.pyplot as plt\n",
+    "except ModuleNotFoundError:\n",
+    "    plt = None\n",
+    "\n",
+    "try:\n",
+    "    from IPython.display import display\n",
+    "except ModuleNotFoundError:\n",
+    "    display = print\n",
+    "\n",
+    "VALID_MONTHS = 3\n",
+    "LIMIT_BYN = 30_000_000\n",
+    "MAX_RUN_DAYS = 7\n",
+    "MILLION = 1_000_000\n",
+    "SHORT_LEADS = (1, 7, 14, 30)\n",
+    "BUCKETS = ((1, 7), (8, 14), (15, 30), (31, 90), (91, 180), (181, 366))\n",
+    "DAY_NAMES = [\"Пн\", \"Вт\", \"Ср\", \"Чт\", \"Пт\", \"Сб\", \"Вс\"]"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "forecast-03",
+   "metadata": {},
+   "source": [
+    "## 1. Проверка данных и разделение по времени\n",
+    "\n",
+    "На общей дневной шкале пропуски остаются `NaN`. Если данные есть только по рабочим дням, ошибка за выходные неизвестна. Разделы располагаются в порядке train → valid → test. Граничная дата относится к более раннему разделу. Так, при последнем факте 31 января тест начинается 1 августа."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-04",
+   "metadata": {},
+   "source": [
+    "def prepare_balances(frame):\n",
+    "    if not isinstance(frame, pd.DataFrame):\n",
+    "        raise TypeError(\"df должен быть pandas DataFrame.\")\n",
+    "    if not frame.columns.is_unique or not {\"date\", \"amount\"}.issubset(frame.columns):\n",
+    "        raise ValueError(\"Нужны уникальные колонки, включая date и amount.\")\n",
+    "    if frame.empty:\n",
+    "        raise ValueError(\"df пуст.\")\n",
+    "\n",
+    "    date = frame[\"date\"]\n",
+    "    if pd.api.types.is_datetime64_any_dtype(date.dtype):\n",
+    "        if date.dt.tz is not None or not date.eq(date.dt.normalize()).all():\n",
+    "            raise ValueError(\"В date нужны календарные даты без времени и часового пояса.\")\n",
+    "        parsed = date\n",
+    "    else:\n",
+    "        date = date.astype(\"string\")\n",
+    "        if not date.str.fullmatch(r\"[0-9]{4}-[0-9]{2}-[0-9]{2}\").fillna(False).all():\n",
+    "            raise ValueError(\"Строковые даты должны иметь формат YYYY-MM-DD.\")\n",
+    "        parsed = pd.to_datetime(date, format=\"%Y-%m-%d\", errors=\"coerce\")\n",
+    "    if parsed.isna().any():\n",
+    "        raise ValueError(\"В date есть пропуски или несуществующие даты.\")\n",
+    "    if parsed.duplicated().any():\n",
+    "        repeated = parsed.loc[parsed.duplicated(keep=False)].dt.strftime(\"%Y-%m-%d\").unique()\n",
+    "        raise ValueError(f\"Даты встречаются повторно: {', '.join(repeated[:5])}.\")\n",
+    "\n",
+    "    amount = pd.to_numeric(frame[\"amount\"], errors=\"coerce\").to_numpy(dtype=float, na_value=np.nan)\n",
+    "    if not np.isfinite(amount).all():\n",
+    "        raise ValueError(\"В amount нужны конечные числовые суммы без пропусков.\")\n",
+    "    observed = pd.Series(amount, index=pd.DatetimeIndex(parsed, name=\"date\"), name=\"amount\")\n",
+    "    return observed.sort_index().asfreq(\"D\")\n",
+    "\n",
+    "\n",
+    "def split_balances(series, valid_months):\n",
+    "    if not isinstance(valid_months, int) or valid_months < 1:\n",
+    "        raise ValueError(\"VALID_MONTHS должен быть положительным целым числом.\")\n",
+    "    as_of = series.index[-1]\n",
+    "    test_cut = as_of - pd.DateOffset(months=6)\n",
+    "    valid_cut = test_cut - pd.DateOffset(months=valid_months)\n",
+    "    train = series.loc[:valid_cut]\n",
+    "    valid = series.loc[(series.index > valid_cut) & (series.index <= test_cut)]\n",
+    "    test = series.loc[series.index > test_cut]\n",
+    "    if len(train) < 60 or train.count() < 45:\n",
+    "        raise ValueError(\"После выделения valid и шестимесячного test в train нужно хотя бы \"\n",
+    "                         \"60 календарных дней и 45 наблюдений.\")\n",
+    "    if valid.count() < 30 or test.count() < 30:\n",
+    "        raise ValueError(\"Для оценки нужно хотя бы 30 наблюдений в каждом из valid и test.\")\n",
+    "    return train, valid, test\n",
+    "\n",
+    "\n",
+    "if \"df\" not in globals():\n",
+    "    raise NameError(\"Подготовьте в этом ядре df с колонками date и amount и запустите ячейку снова.\")\n",
+    "\n",
+    "y = prepare_balances(df)\n",
+    "train, valid, test = split_balances(y, VALID_MONTHS)\n",
+    "display(pd.DataFrame([\n",
+    "    {\"раздел\": name, \"от\": s.index[0].date(), \"до\": s.index[-1].date(),\n",
+    "     \"фактов\": s.count(), \"календарных дней\": len(s), \"пропусков\": s.isna().sum(),\n",
+    "     \"покрытие, %\": round(100 * s.notna().mean(), 1)}\n",
+    "    for name, s in [(\"train\", train), (\"valid\", valid), (\"test\", test)]\n",
+    "]).set_index(\"раздел\"))"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "forecast-05",
+   "metadata": {},
+   "source": [
+    "## 2. Базовая EDA на train\n",
+    "\n",
+    "Проверяем уровни, дневные изменения, покрытие по дням недели и крупные скачки. Дневное изменение вычисляется только между соседними календарными датами с фактом. Скачки остаются в данных."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-06",
+   "metadata": {},
+   "source": [
+    "delta = train.diff()\n",
+    "display(pd.DataFrame({\"остаток\": train, \"изменение\": delta}).div(MILLION)\n",
+    "        .describe(percentiles=[.01, .05, .50, .95, .99]).round(2))\n",
+    "display(pd.Series({\"нулевых остатков\": train.eq(0).sum(),\n",
+    "                   \"отрицательных остатков\": train.lt(0).sum(),\n",
+    "                   \"дневных изменений свыше 30 млн BYN по модулю\": delta.abs().gt(LIMIT_BYN).sum()}))\n",
+    "coverage_week = train.notna().groupby(train.index.dayofweek).agg([\"sum\", \"size\"])\n",
+    "coverage_week.index = [DAY_NAMES[i] for i in coverage_week.index]\n",
+    "display(coverage_week.rename(columns={\"sum\": \"фактов\", \"size\": \"календарных дней\"}))\n",
+    "largest = delta.abs().dropna().nlargest(10).index\n",
+    "display(pd.DataFrame({\"остаток, млн BYN\": train.loc[largest] / MILLION,\n",
+    "                     \"изменение, млн BYN\": delta.loc[largest] / MILLION}).round(2))\n",
+    "\n",
+    "if plt is not None:\n",
+    "    fig, ax = plt.subplots(2, 1, sharex=True, figsize=(12, 6), layout=\"constrained\")\n",
+    "    ax[0].plot(train / MILLION, color=\"#155e75\", label=\"Остаток\")\n",
+    "    ax[0].plot(train.rolling(30, min_periods=15).median() / MILLION,\n",
+    "               color=\"#e0782f\", label=\"Скользящая медиана за 30 дней\")\n",
+    "    ax[0].legend()\n",
+    "    ax[1].plot(delta / MILLION, color=\"#155e75\", linewidth=.8)\n",
+    "    for value in (-LIMIT_BYN / MILLION, LIMIT_BYN / MILLION):\n",
+    "        ax[1].axhline(value, color=\"#b91c1c\", linestyle=\"--\", linewidth=.8)\n",
+    "    ax[1].set_title(\"Дневное изменение остатка\")\n",
+    "    for axis in ax:\n",
+    "        axis.set_ylabel(\"млн BYN\")\n",
+    "        axis.grid(alpha=.2)\n",
+    "    plt.show()"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "forecast-07",
+   "metadata": {},
+   "source": [
+    "## 3. Проверка сезонности на train\n",
+    "\n",
+    "Для недельной и внутримесячной сезонности убираем локальный уровень медианой за 63 дня. Сравниваем профили по двум последовательным половинам train и считаем автокорреляцию по фактически наблюдаемым парам. Конец месяца смотрим отдельно, потому что длина месяца меняется. Для годового цикла используем месячные медианы после удаления линейного тренда отдельно в каждой половине. Для годового сравнения нужен хотя бы год календарного покрытия в каждой половине.\n",
+    "\n",
+    "Корреляции профилей и автокорреляция — описательные признаки повторяемости. Ориентир 0,5 используется для чтения таблицы. Прикладную ценность сезонности проверяет сравнение ошибок на valid. [Диагностика сезонности временных рядов](https://otexts.robjhyndman.com/fpp3/graphics.html)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-08",
+   "metadata": {},
+   "source": [
+    "def local_residual(series):\n",
+    "    return series - series.rolling(63, center=True, min_periods=24).median()\n",
+    "\n",
+    "\n",
+    "def pairwise_acf(series, lags, min_pairs=20):\n",
+    "    rows = []\n",
+    "    for lag in lags:\n",
+    "        pairs = pd.concat([series, series.shift(lag)], axis=1).dropna()\n",
+    "        enough_variation = pairs.nunique().gt(1).all()\n",
+    "        corr = pairs.iloc[:, 0].corr(pairs.iloc[:, 1]) if len(pairs) >= min_pairs and enough_variation else np.nan\n",
+    "        rows.append({\"лаг\": lag, \"пар\": len(pairs), \"ACF\": corr})\n",
+    "    return pd.DataFrame(rows).set_index(\"лаг\")\n",
+    "\n",
+    "\n",
+    "def annual_residual(series):\n",
+    "    monthly = series.resample(\"MS\").agg([\"median\", \"count\", \"size\"])\n",
+    "    reliable = (monthly[\"size\"] == monthly.index.days_in_month) & (\n",
+    "        monthly[\"count\"] >= .60 * monthly.index.days_in_month\n",
+    "    )\n",
+    "    medians = monthly[\"median\"].where(reliable)\n",
+    "    mask = medians.notna().to_numpy()\n",
+    "    if mask.sum() < 12:\n",
+    "        return medians * np.nan\n",
+    "    t = np.arange(len(medians))\n",
+    "    slope, intercept = np.polyfit(t[mask], (medians[mask] - medians[mask].iloc[0]) / MILLION, 1)\n",
+    "    return medians - medians[mask].iloc[0] - (t * slope + intercept) * MILLION\n",
+    "\n",
+    "\n",
+    "def paired_profile(halves, group, minimum_per_group, minimum_groups):\n",
+    "    table = pd.concat({\n",
+    "        label: z.groupby(group(z.index)).agg([\"median\", \"count\"])\n",
+    "        for label, z in halves.items()\n",
+    "    }, axis=1)\n",
+    "    medians = table.xs(\"median\", axis=1, level=1)\n",
+    "    counts = table.xs(\"count\", axis=1, level=1)\n",
+    "    comparable = medians.loc[counts.ge(minimum_per_group).all(axis=1)].dropna()\n",
+    "    enough_variation = comparable.nunique().gt(1).all()\n",
+    "    correlation = (comparable.iloc[:, 0].corr(comparable.iloc[:, 1])\n",
+    "                   if len(comparable) >= minimum_groups and enough_variation else np.nan)\n",
+    "    spread = medians.max() - medians.min()\n",
+    "    summary = {\"сравнимых групп\": len(comparable), \"корреляция профилей\": correlation,\n",
+    "               \"размах профиля 1, млн BYN\": spread.iloc[0] / MILLION,\n",
+    "               \"размах профиля 2, млн BYN\": spread.iloc[1] / MILLION}\n",
+    "    return medians / MILLION, counts, summary\n",
+    "\n",
+    "\n",
+    "middle = len(train) // 2\n",
+    "halves = {\"первая половина\": train.iloc[:middle], \"вторая половина\": train.iloc[middle:]}\n",
+    "short_halves = {name: local_residual(part) for name, part in halves.items()}\n",
+    "annual_halves = {name: annual_residual(part) for name, part in halves.items()}\n",
+    "checks = {\n",
+    "    \"день недели\": paired_profile(short_halves, lambda d: d.dayofweek, 4, 5),\n",
+    "    \"день месяца\": paired_profile(short_halves, lambda d: d.day, 2, 20),\n",
+    "    \"последние семь дней месяца\": paired_profile(\n",
+    "        {name: part.loc[(part.index.days_in_month - part.index.day) < 7]\n",
+    "         for name, part in short_halves.items()},\n",
+    "        lambda d: d.day - d.days_in_month, 2, 5),\n",
+    "    \"месяц года\": paired_profile(annual_halves, lambda d: d.month, 1, 12),\n",
+    "}\n",
+    "seasonality = pd.DataFrame({name: result[2] for name, result in checks.items()}).T\n",
+    "seasonality[\"интерпретация\"] = [\n",
+    "    \"недостаточно сопоставимых данных\" if pd.isna(c)\n",
+    "    else \"профили согласованы\" if c >= .5 else \"устойчивый рисунок по профилям слабо выражен\"\n",
+    "    for c in seasonality[\"корреляция профилей\"]\n",
+    "]\n",
+    "display(seasonality.round(3))\n",
+    "\n",
+    "week_profile, week_counts, _ = checks[\"день недели\"]\n",
+    "week_table = pd.concat({\"медиана, млн BYN\": week_profile, \"наблюдений\": week_counts}, axis=1)\n",
+    "display(week_table.rename(index=dict(enumerate(DAY_NAMES))).round(2))\n",
+    "level_acf = pairwise_acf(local_residual(train), [1, 7, 14, 21, 28, 29, 30, 31, 35, 60, 365, 366])\n",
+    "change_acf = pairwise_acf(delta, level_acf.index)\n",
+    "display(pd.concat({\"остаток после удаления уровня\": level_acf,\n",
+    "                   \"дневное изменение\": change_acf}, axis=1).round(3))\n",
+    "annual_acf = pairwise_acf(annual_residual(train), [12], min_pairs=12)\n",
+    "display(annual_acf.rename_axis(\"лаг, месяцев\").round(3))\n",
+    "month_end_profile, month_end_counts, _ = checks[\"последние семь дней месяца\"]\n",
+    "display(pd.concat({\"медиана, млн BYN\": month_end_profile, \"наблюдений\": month_end_counts}, axis=1).round(2))\n",
+    "\n",
+    "if plt is not None:\n",
+    "    fig, axes = plt.subplots(2, 2, figsize=(12, 7), layout=\"constrained\")\n",
+    "    for axis, (name, (profile, counts, _)) in zip(axes.flat, checks.items()):\n",
+    "        if profile.notna().any().any():\n",
+    "            profile.plot(ax=axis, marker=\".\", color=[\"#155e75\", \"#e0782f\"])\n",
+    "            axis.axhline(0, color=\"gray\", linewidth=.7)\n",
+    "        else:\n",
+    "            axis.text(.5, .5, \"Мало наблюдений\", ha=\"center\", transform=axis.transAxes)\n",
+    "        if name == \"день недели\":\n",
+    "            axis.set_xticks(range(7), DAY_NAMES)\n",
+    "        axis.set_title(name)\n",
+    "        axis.set_ylabel(\"млн BYN\")\n",
+    "        axis.grid(alpha=.2)\n",
+    "    plt.show()"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "forecast-09",
+   "metadata": {},
+   "source": [
+    "## 4. Обучение моделей-кандидатов на train\n",
+    "\n",
+    "Базовые модели сохраняют последний остаток или повторяют недельный шаблон. Календарные модели оценивают эффект дней недели и положения дня в месяце. Отдельный вариант добавляет затухающий локальный тренд. При наличии сопоставимых дат прошлого года добавляем их профиль со сдвигом уровня. В каждом прогнозе этот сдвиг, текущий уровень и локальный тренд берутся из наблюдений к дате выпуска."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-10",
+   "metadata": {},
+   "source": [
+    "MODEL_NAMES = (\"last_balance\", \"weekly_naive\", \"calendar_week\", \"calendar_week_month\",\n",
+    "               \"calendar_damped\", \"annual_profile\")\n",
+    "\n",
+    "\n",
+    "def calendar_features(dates, monthly):\n",
+    "    weekly = np.eye(7)[dates.dayofweek]\n",
+    "    if not monthly:\n",
+    "        return weekly\n",
+    "    phase = 2 * np.pi * (dates.day.to_numpy() - 1) / dates.days_in_month.to_numpy()\n",
+    "    return np.column_stack([\n",
+    "        weekly, np.sin(phase), np.cos(phase), np.sin(2 * phase), np.cos(2 * phase),\n",
+    "        dates.day <= 3, dates.days_in_month - dates.day <= 2,\n",
+    "    ])\n",
+    "\n",
+    "\n",
+    "def fit_calendar(series, monthly):\n",
+    "    residual = local_residual(series).dropna()\n",
+    "    if len(residual) < 30:\n",
+    "        return None\n",
+    "    features = calendar_features(residual.index, monthly)\n",
+    "    penalty = 3 * np.eye(features.shape[1])\n",
+    "    return np.linalg.solve(features.T @ features + penalty, features.T @ residual.to_numpy())\n",
+    "\n",
+    "\n",
+    "def last_year_pairs(history, origin):\n",
+    "    recent = history.loc[origin - pd.Timedelta(days=27):origin].dropna()\n",
+    "    prior = history.reindex(recent.index - pd.DateOffset(years=1)).to_numpy()\n",
+    "    return (recent - prior).dropna()\n",
+    "\n",
+    "\n",
+    "def seasonal_models(training):\n",
+    "    return {\"week\": fit_calendar(training, monthly=False),\n",
+    "            \"week_month\": fit_calendar(training, monthly=True)}\n",
+    "\n",
+    "\n",
+    "def forecast_path(model, coefficients, history, origin, dates):\n",
+    "    # Срез выполняется до любых расчётов состояния прогноза.\n",
+    "    known = history.loc[:origin]\n",
+    "    latest = float(known.loc[origin])\n",
+    "    lead = (dates - origin).days.to_numpy()\n",
+    "    if model == \"last_balance\":\n",
+    "        prediction = np.full(len(dates), latest)\n",
+    "    elif model == \"weekly_naive\":\n",
+    "        recent = known.loc[origin - pd.Timedelta(days=13):].dropna()\n",
+    "        weekday_balance = recent.groupby(recent.index.dayofweek).last()\n",
+    "        prediction = weekday_balance.reindex(dates.dayofweek).fillna(latest).to_numpy()\n",
+    "    else:\n",
+    "        monthly = model != \"calendar_week\"\n",
+    "        beta = coefficients[\"week_month\" if monthly else \"week\"]\n",
+    "        if beta is None:\n",
+    "            beta = np.zeros(calendar_features(dates[:1], monthly).shape[1])\n",
+    "        recent = known.loc[origin - pd.Timedelta(days=55):].dropna()\n",
+    "        season_past = calendar_features(recent.index, monthly) @ beta\n",
+    "        adjusted = pd.Series(recent.to_numpy() - season_past, index=recent.index)\n",
+    "        offsets = (adjusted.index - origin).days.to_numpy()\n",
+    "        level = adjusted.loc[offsets >= -6].median()\n",
+    "        shock = adjusted.iloc[-1] - level\n",
+    "        prediction = level + calendar_features(dates, monthly) @ beta + shock * np.exp(-lead / 7)\n",
+    "\n",
+    "        if model == \"calendar_damped\":\n",
+    "            near = offsets >= -13\n",
+    "            older = offsets <= -28\n",
+    "            if near.sum() >= 7 and older.sum() >= 7:\n",
+    "                slope = ((adjusted.loc[near].median() - adjusted.loc[older].median())\n",
+    "                         / (np.median(offsets[near]) - np.median(offsets[older])))\n",
+    "                prediction += slope * (-60 * np.expm1(-lead / 60))\n",
+    "\n",
+    "        if model == \"annual_profile\":\n",
+    "            paired = last_year_pairs(known, origin)\n",
+    "            if len(paired) >= 14:\n",
+    "                shift = paired.median()\n",
+    "                previous_origin = origin - pd.DateOffset(years=1)\n",
+    "                previous = known.get(previous_origin, np.nan)\n",
+    "                correction = latest - previous - shift if pd.notna(previous) else 0.0\n",
+    "                annual = known.reindex(dates - pd.DateOffset(years=1)).to_numpy()\n",
+    "                prediction = np.where(np.isfinite(annual),\n",
+    "                                      annual + shift + correction * np.exp(-lead / 14), prediction)\n",
+    "    return pd.Series(np.round(prediction, 2), index=dates, name=\"forecast_byn\")\n",
+    "\n",
+    "\n",
+    "train_coefficients = seasonal_models(train)\n",
+    "train_origin = train.last_valid_index()\n",
+    "candidates = list(MODEL_NAMES[:2])\n",
+    "if train_coefficients[\"week\"] is not None:\n",
+    "    candidates.extend(MODEL_NAMES[2:5])\n",
+    "else:\n",
+    "    print(\"Для календарной регрессии мало наблюдений с оценённым локальным уровнем.\")\n",
+    "if len(last_year_pairs(train, train_origin)) >= 14:\n",
+    "    candidates.append(\"annual_profile\")\n",
+    "print(\"Кандидаты:\", \", \".join(candidates))"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "forecast-11",
+   "metadata": {},
+   "source": [
+    "## 5. Выбор модели на valid\n",
+    "\n",
+    "По каждой дате выпуска проверяем следующие 30 календарных дней, попадающих в valid. Для горизонтов 1, 7, 14 и 30 дней также проверяем серии ошибок одной заблаговременности по последовательным целевым датам. Семь дней с абсолютной ошибкой строго больше 30 млн BYN допустимы. Восьмой день образует нарушение. При неизвестном факте считаем и наблюдаемую, и максимально возможную серию.\n",
+    "\n",
+    "Сначала сравниваем наличие нарушения, затем число нарушивших траекторий и фиксированных горизонтов и длину превышения допустимой серии. При равенстве сравниваем MAE с весами 50%, 30%, 20% для интервалов 1–7, 8–14 и 15–30 дней. Коэффициенты всех кандидатов обучены на train. Для каждого выпуска допускаются только факты, известные к его дате. [Проверка прогноза со скользящей датой выпуска](https://otexts.com/fpp3/toolbox.html#time-series-cross-validation)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-12",
+   "metadata": {},
+   "source": [
+    "def rolling_panel(model, coefficients, history, period, max_lead):\n",
+    "    start, end = period.index[[0, -1]]\n",
+    "    parts = []\n",
+    "    for origin in pd.date_range(start - pd.Timedelta(days=1), end - pd.Timedelta(days=1)):\n",
+    "        last_date = min(end, origin + pd.Timedelta(days=max_lead))\n",
+    "        dates = pd.date_range(origin + pd.Timedelta(days=1), last_date, name=\"date\")\n",
+    "        actual = period.reindex(dates)\n",
+    "        prediction = (forecast_path(model, coefficients, history, origin, dates)\n",
+    "                      if pd.notna(history.get(origin, np.nan)) else np.nan)\n",
+    "        part = pd.DataFrame({\"actual_byn\": actual, \"forecast_byn\": prediction}, index=dates)\n",
+    "        part[\"origin\"] = origin\n",
+    "        part[\"lead\"] = (dates - origin).days\n",
+    "        parts.append(part.reset_index())\n",
+    "    panel = pd.concat(parts, ignore_index=True)\n",
+    "    return panel.assign(error_byn=(panel[\"forecast_byn\"] - panel[\"actual_byn\"]).round(2))\n",
+    "\n",
+    "\n",
+    "def longest_run(mask):\n",
+    "    boundaries = np.flatnonzero(np.diff(np.r_[False, mask, False]))\n",
+    "    lengths = boundaries[1::2] - boundaries[::2]\n",
+    "    if not len(lengths):\n",
+    "        return 0, None, None\n",
+    "    i = int(lengths.argmax())\n",
+    "    return int(lengths[i]), int(boundaries[2 * i]), int(boundaries[2 * i + 1] - 1)\n",
+    "\n",
+    "\n",
+    "def run_stats(errors):\n",
+    "    # Пропущенные календарные дни остаются в последовательности.\n",
+    "    exceeds = errors.abs().gt(LIMIT_BYN).to_numpy()\n",
+    "    observed, start, end = longest_run(exceeds)\n",
+    "    possible, _, _ = longest_run(exceeds | errors.isna().to_numpy())\n",
+    "    return {\"max_observed_days\": observed, \"max_possible_days\": possible,\n",
+    "            \"first_exceedance_date\": errors.index[start] if start is not None else pd.NaT,\n",
+    "            \"last_exceedance_date\": errors.index[end] if end is not None else pd.NaT}\n",
+    "\n",
+    "\n",
+    "def limit_status(observed, possible, testable, has_fact):\n",
+    "    if observed > MAX_RUN_DAYS:\n",
+    "        return \"failed\"\n",
+    "    if not testable:\n",
+    "        return \"insufficient_history\"\n",
+    "    if not has_fact or possible > MAX_RUN_DAYS:\n",
+    "        return \"insufficient_coverage\"\n",
+    "    return \"passed\"\n",
+    "\n",
+    "\n",
+    "def path_report(panel, horizon):\n",
+    "    rows = []\n",
+    "    for origin, group in panel.loc[panel[\"lead\"] <= horizon].groupby(\"origin\"):\n",
+    "        errors = group.set_index(\"date\")[\"error_byn\"]\n",
+    "        rows.append({\"origin\": origin, \"full\": len(errors) == horizon,\n",
+    "                     \"complete\": len(errors) == horizon and errors.notna().all(),\n",
+    "                     **run_stats(errors)})\n",
+    "    runs = pd.DataFrame(rows)\n",
+    "    worst = runs.loc[runs[\"max_observed_days\"].idxmax()]\n",
+    "    observed = int(worst[\"max_observed_days\"])\n",
+    "    possible = int(runs[\"max_possible_days\"].max())\n",
+    "    return {\n",
+    "        \"status\": limit_status(observed, possible, runs[\"full\"].any(), runs[\"complete\"].any()),\n",
+    "        \"max_observed_days\": observed, \"max_possible_days\": possible,\n",
+    "        \"failed_origins\": int(runs[\"max_observed_days\"].gt(MAX_RUN_DAYS).sum()),\n",
+    "        \"full_origins\": int(runs[\"full\"].sum()), \"complete_origins\": int(runs[\"complete\"].sum()),\n",
+    "        \"worst_origin\": worst[\"origin\"] if observed else pd.NaT,\n",
+    "        \"first_exceedance_date\": worst[\"first_exceedance_date\"],\n",
+    "        \"last_exceedance_date\": worst[\"last_exceedance_date\"],\n",
+    "    }\n",
+    "\n",
+    "\n",
+    "def error_metrics(errors):\n",
+    "    fact = errors.dropna()\n",
+    "    return {\"observations\": len(fact), \"expected\": len(errors),\n",
+    "            \"mae_byn\": fact.abs().mean(), \"bias_byn\": fact.mean(),\n",
+    "            \"rmse_byn\": np.sqrt(np.mean(np.square(fact))),\n",
+    "            \"outside_limit\": int(fact.abs().gt(LIMIT_BYN).sum()),\n",
+    "            \"overstated_balance\": int(fact.gt(LIMIT_BYN).sum())}\n",
+    "\n",
+    "\n",
+    "def fixed_lead_report(panel, leads):\n",
+    "    rows = []\n",
+    "    for lead in leads:\n",
+    "        errors = panel.loc[panel[\"lead\"].eq(lead)].set_index(\"date\")[\"error_byn\"].sort_index()\n",
+    "        runs = run_stats(errors)\n",
+    "        metrics = error_metrics(errors)\n",
+    "        rows.append({\"lead\": lead,\n",
+    "                     \"status\": limit_status(runs[\"max_observed_days\"], runs[\"max_possible_days\"],\n",
+    "                                            len(errors) > MAX_RUN_DAYS, errors.count() > MAX_RUN_DAYS),\n",
+    "                     **metrics, **runs})\n",
+    "    return pd.DataFrame(rows).set_index(\"lead\")\n",
+    "\n",
+    "\n",
+    "def bucket_report(panel):\n",
+    "    return pd.DataFrame(\n",
+    "        [{\"days\": f\"{lo}–{hi}\" if lo < 181 else \"181–год\",\n",
+    "          **error_metrics(panel.loc[panel[\"lead\"].between(lo, hi), \"error_byn\"])}\n",
+    "         for lo, hi in BUCKETS]\n",
+    "    ).set_index(\"days\")\n",
+    "\n",
+    "\n",
+    "def validation_score(model, coefficients, history, period):\n",
+    "    panel = rolling_panel(model, coefficients, history, period, max_lead=30)\n",
+    "    path = path_report(panel, 30)\n",
+    "    fixed = fixed_lead_report(panel, SHORT_LEADS)\n",
+    "    bands = bucket_report(panel).iloc[:3]\n",
+    "    weights = np.array([.5, .3, .2])\n",
+    "    mae = bands[\"mae_byn\"].to_numpy()\n",
+    "    known = np.isfinite(mae)\n",
+    "    return {\n",
+    "        \"model\": model,\n",
+    "        \"any_failure\": path[\"status\"] == \"failed\" or fixed[\"status\"].eq(\"failed\").any(),\n",
+    "        \"failed_paths\": path[\"failed_origins\"],\n",
+    "        \"failed_fixed_leads\": int(fixed[\"status\"].eq(\"failed\").sum()),\n",
+    "        \"run_excess\": max(0, max(path[\"max_observed_days\"], fixed[\"max_observed_days\"].max()) - MAX_RUN_DAYS),\n",
+    "        \"weighted_mae_byn\": np.average(mae[known], weights=weights[known]) if known.any() else np.inf,\n",
+    "        \"observations\": int(bands[\"observations\"].sum()),\n",
+    "    }\n",
+    "\n",
+    "\n",
+    "train_valid = pd.concat([train, valid])\n",
+    "scores = pd.DataFrame([validation_score(m, train_coefficients, train_valid, valid)\n",
+    "                       for m in candidates]).set_index(\"model\")\n",
+    "if not np.isfinite(scores[\"weighted_mae_byn\"]).any():\n",
+    "    raise ValueError(\"В valid нет наблюдаемых пар прогноз–факт на горизонтах до 30 дней.\")\n",
+    "scores = scores.sort_values([\"any_failure\", \"failed_paths\", \"failed_fixed_leads\", \"run_excess\",\n",
+    "                             \"weighted_mae_byn\"], kind=\"stable\")\n",
+    "selected_model = scores.index[0]\n",
+    "display(scores.round(2))\n",
+    "print(\"Выбранная модель:\", selected_model)"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "forecast-13",
+   "metadata": {},
+   "source": [
+    "## 6. Шестимесячный test\n",
+    "\n",
+    "После выбора модели один раз переобучаем её коэффициенты на train + valid. Сравниваем две схемы. Фиксированный прогноз строится из последней наблюдаемой даты перед test и использует только train + valid. В ежедневном пересчёте коэффициенты остаются фиксированными, а состояние обновляется фактами, известными к дате выпуска. Модель и настройки по результатам test не меняются.\n",
+    "\n",
+    "Ошибка в таблицах — прогноз минус факт. Положительное смещение означает завышенный остаток. `passed` относится к доступному историческому отрезку. `failed` означает наблюдаемое нарушение. `insufficient_history` указывает на короткий горизонт проверки, `insufficient_coverage` — на нехватку фактов. Шестимесячный test оценивает только горизонты, для которых появились фактические значения."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-14",
+   "metadata": {},
+   "source": [
+    "test_coefficients = seasonal_models(train_valid)\n",
+    "frozen_origin = train_valid.last_valid_index()\n",
+    "frozen_forecast = forecast_path(selected_model, test_coefficients, train_valid, frozen_origin, test.index)\n",
+    "frozen = pd.DataFrame({\"actual_byn\": test, \"forecast_byn\": frozen_forecast}, index=test.index)\n",
+    "frozen[\"lead\"] = (frozen.index - frozen_origin).days\n",
+    "frozen[\"error_byn\"] = (frozen[\"forecast_byn\"] - frozen[\"actual_byn\"]).round(2)\n",
+    "frozen_run = run_stats(frozen[\"error_byn\"])\n",
+    "frozen_metrics = {\n",
+    "    \"origin\": frozen_origin,\n",
+    "    \"status\": limit_status(frozen_run[\"max_observed_days\"], frozen_run[\"max_possible_days\"],\n",
+    "                           len(frozen) > MAX_RUN_DAYS, frozen[\"error_byn\"].count() > MAX_RUN_DAYS),\n",
+    "    **error_metrics(frozen[\"error_byn\"]), **frozen_run,\n",
+    "}\n",
+    "\n",
+    "test_panel = rolling_panel(selected_model, test_coefficients, y, test, max_lead=len(test))\n",
+    "test_fixed_leads = fixed_lead_report(test_panel, (*SHORT_LEADS, 90, 180, 365))\n",
+    "test_paths = pd.DataFrame({\n",
+    "    \"первые 30 дней из одной даты выпуска\": path_report(test_panel, 30),\n",
+    "    \"вся доступная траектория из одной даты выпуска\": path_report(test_panel, len(test)),\n",
+    "}).T\n",
+    "test_buckets = pd.concat({\"фиксированный прогноз\": bucket_report(frozen),\n",
+    "                          \"ежедневный пересчёт\": bucket_report(test_panel)}, axis=1)\n",
+    "\n",
+    "metric_rounding = {\"mae_byn\": 2, \"bias_byn\": 2, \"rmse_byn\": 2}\n",
+    "display(pd.DataFrame([frozen_metrics], index=[\"Фиксированный прогноз\"]).round(metric_rounding))\n",
+    "display(test_paths)\n",
+    "display(test_fixed_leads.round(metric_rounding))\n",
+    "display(test_buckets.round(2))\n",
+    "\n",
+    "if plt is not None:\n",
+    "    fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True, layout=\"constrained\")\n",
+    "    ax[0].plot(frozen[\"actual_byn\"] / MILLION, label=\"Факт\", color=\"#155e75\")\n",
+    "    ax[0].plot(frozen[\"forecast_byn\"] / MILLION,\n",
+    "               label=\"Прогноз из конца train + valid\", color=\"#e0782f\")\n",
+    "    ax[0].legend()\n",
+    "    ax[1].plot(frozen[\"error_byn\"] / MILLION, label=\"Ошибка прогноза\", color=\"#155e75\")\n",
+    "    ax[1].axhspan(-LIMIT_BYN / MILLION, LIMIT_BYN / MILLION, color=\"#d1fae5\", alpha=.6)\n",
+    "    ax[1].axhline(0, color=\"gray\", linewidth=.8)\n",
+    "    ax[1].legend()\n",
+    "    for axis in ax:\n",
+    "        axis.set_ylabel(\"млн BYN\")\n",
+    "        axis.grid(alpha=.2)\n",
+    "    plt.show()"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "forecast-15",
+   "metadata": {},
+   "source": [
+    "## 7. Прогноз на год и ГЭПы\n",
+    "\n",
+    "Для будущего прогноза обучаем выбранную модель на всей доступной истории. Этот пересчёт выполняется после теста. Год заканчивается в ту же календарную дату следующего года. Изменение остатков используется как приближение чистого потока. Капитализацию процентов и другие безденежные изменения, если они входят во входной ряд, следует учесть при формировании денежных потоков.\n",
+    "\n",
+    "Пиковая потребность по интервалу — максимальное падение остатка от последнего факта до любой даты внутри интервала, минимум ноль. Пики по интервалам имеют общую точку отсчёта. Для общего ГЭПа банка нужны также потоки остальных существенных активов, обязательств и внебалансовых позиций. [Принципы Базельского комитета](https://www.bis.org/committees/bcbs/basel-consolidated-guidelines/module/lqy/10)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "forecast-16",
+   "metadata": {},
+   "source": [
+    "as_of = y.last_valid_index()\n",
+    "future_dates = pd.date_range(as_of + pd.Timedelta(days=1), as_of + pd.DateOffset(years=1), name=\"date\")\n",
+    "production_coefficients = seasonal_models(y)\n",
+    "future_forecast = forecast_path(selected_model, production_coefficients, y, as_of, future_dates)\n",
+    "opening_balance = float(y.loc[as_of])\n",
+    "\n",
+    "forecast_df = future_forecast.to_frame()\n",
+    "forecast_df[\"lead\"] = (future_dates - as_of).days\n",
+    "forecast_df[\"net_flow_byn\"] = np.round(np.diff(np.r_[opening_balance, future_forecast.to_numpy()]), 2)\n",
+    "forecast_df[\"cumulative_gap_byn\"] = (future_forecast - opening_balance).round(2)\n",
+    "forecast_df[\"funding_need_byn\"] = (-forecast_df[\"cumulative_gap_byn\"]).clip(lower=0)\n",
+    "\n",
+    "gap_rows = []\n",
+    "for lo, hi in BUCKETS:\n",
+    "    portion = forecast_df.loc[forecast_df[\"lead\"].between(lo, hi)]\n",
+    "    start_balance = opening_balance if lo == 1 else float(future_forecast.iloc[lo - 2])\n",
+    "    end_balance = float(portion[\"forecast_byn\"].iloc[-1])\n",
+    "    peak = float(portion[\"funding_need_byn\"].max())\n",
+    "    gap_rows.append({\n",
+    "        \"days\": f\"{lo}–{hi}\" if lo < 181 else \"181–год\",\n",
+    "        \"start\": portion.index[0].date(), \"end\": portion.index[-1].date(),\n",
+    "        \"opening_byn\": start_balance, \"closing_byn\": end_balance,\n",
+    "        \"net_flow_byn\": round(end_balance - start_balance, 2),\n",
+    "        \"cumulative_gap_byn\": float(portion[\"cumulative_gap_byn\"].iloc[-1]),\n",
+    "        \"peak_funding_need_byn\": peak,\n",
+    "        \"peak_date\": portion[\"funding_need_byn\"].idxmax().date() if peak > 0 else pd.NaT,\n",
+    "    })\n",
+    "gaps_df = pd.DataFrame(gap_rows).set_index(\"days\")\n",
+    "\n",
+    "display(forecast_df.head(10))\n",
+    "display(gaps_df)\n",
+    "\n",
+    "if plt is not None:\n",
+    "    fig, ax = plt.subplots(figsize=(12, 3.5), layout=\"constrained\")\n",
+    "    ax.plot(forecast_df[\"funding_need_byn\"] / MILLION, color=\"#9a3412\")\n",
+    "    ax.set(title=\"Дневная потребность в замещении средств\", ylabel=\"млн BYN\")\n",
+    "    ax.grid(alpha=.2)\n",
+    "    plt.show()"
+   ],
+   "execution_count": null,
+   "outputs": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "pygments_lexer": "ipython3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

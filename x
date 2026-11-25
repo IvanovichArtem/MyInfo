@@ -1,126 +1,68 @@
 import numpy as np
 import pandas as pd
+from catboost import CatBoostRegressor
 
 
-def make_stat_features(
-    df,
-    *,
-    lags=(1, 2, 3, 7, 14, 21, 28, 30, 56, 90, 365),
-    windows=(7, 14, 28, 56, 90),
-    min_coverage=0.5,
-):
-    """Добавляет к REP_DT и OST_VAL признаки по истории одного ряда."""
-    if any(not isinstance(lag, (int, np.integer)) or lag < 1 for lag in lags):
-        raise ValueError("Лаги должны быть положительными целыми числами.")
-    if any(not isinstance(window, (int, np.integer)) or window < 2 for window in windows):
-        raise ValueError("Размеры окон должны быть целыми числами от 2.")
-    if not 0 <= min_coverage <= 1:
-        raise ValueError("min_coverage должен быть от 0 до 1.")
-
-    dates = pd.DatetimeIndex(pd.to_datetime(df["REP_DT"], format="mixed"))
-    dates = dates.tz_localize(None).normalize()
-    if dates.hasnans or dates.has_duplicates:
-        raise ValueError("Нужна одна строка на дату, без пропусков в REP_DT.")
-
-    base = df.assign(REP_DT=dates).set_index("REP_DT").sort_index()
-    calendar = (
-        pd.date_range(base.index[0], base.index[-1], freq="D", name="REP_DT")
-        if len(base) else base.index
-    )
-    balance = (
-        pd.to_numeric(base["OST_VAL"], errors="coerce")
-        .astype(float)
-        .replace([np.inf, -np.inf], np.nan)
-        .reindex(calendar)
+def train_catboost(df, max_months=5):
+    """Обучает модель на каждый горизонт и возвращает модели и метрики."""
+    data = df.copy()
+    data["REP_DT"] = pd.to_datetime(data["REP_DT"]).dt.normalize()
+    data = data.dropna(subset=["REP_DT"]).sort_values("REP_DT")
+    data["OST_VAL"] = pd.to_numeric(data["OST_VAL"], errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
     )
 
-    # Для даты t история заканчивается вчера. Лаги считаются в календарных днях.
-    past = balance.shift(1)
-    past_change = past.diff()
-    features = {}
+    series_cols = ["CURENCY"] if "CURENCY" in data else []
+    feature_cols = data.columns.drop(["REP_DT", "OST_VAL"]).tolist()
+    cat_cols = data[feature_cols].select_dtypes(include=["object", "string", "category"]).columns.tolist()
+    for col in cat_cols:
+        data[col] = data[col].astype("string").fillna("__missing__")
 
-    def safe_ratio(numerator, denominator):
-        return numerator.div(denominator.abs().where(denominator.ne(0)))
+    dates = data["REP_DT"].drop_duplicates().reset_index(drop=True)
+    if len(dates) < 3:
+        raise ValueError("Для train, valid и test нужны хотя бы три разные даты.")
+    valid_start = dates.iloc[int(0.6 * len(dates))]
+    test_start = dates.iloc[int(0.8 * len(dates))]
 
-    def slope_per_day(values):
-        valid = np.isfinite(values)
-        if valid.sum() < 2:
-            return np.nan
-        x = np.flatnonzero(valid)
-        y = values[valid]
-        x = x - x.mean()
-        return (x @ (y - y.mean())) / (x @ x)
+    target_keys = [*series_cols, "target_dt"]
+    balances = data[[*series_cols, "REP_DT", "OST_VAL"]].rename(
+        columns={"REP_DT": "target_dt", "OST_VAL": "target"}
+    )
+    origins = data.drop(columns="OST_VAL")
+    models, metrics = {}, []
 
-    for lag in lags:
-        delayed = balance.shift(lag)
-        features[f"stat_lag_{lag}d"] = delayed
-        if lag > 1:
-            delta = past - delayed
-            features[f"stat_delta_lag1_vs_lag{lag}d"] = delta
-            features[f"stat_rel_delta_lag1_vs_lag{lag}d"] = safe_ratio(delta, delayed)
+    for months in range(1, max_months + 1):
+        horizon = f"{months}m"
+        sample = origins.assign(target_dt=origins["REP_DT"] + pd.DateOffset(months=months))
+        sample = sample.merge(balances, on=target_keys, validate="many_to_one").dropna(subset=["target"])
 
-    date_series = pd.Series(calendar, index=calendar)
-    last_observed = date_series.where(balance.notna()).shift(1).ffill()
-    features["stat_days_since_observation"] = (date_series - last_observed).dt.days
+        # Будущие остатки для train и valid должны быть известны к началу следующей выборки.
+        train = sample[sample["target_dt"] < valid_start]
+        valid = sample[(sample["REP_DT"] >= valid_start) & (sample["target_dt"] < test_start)]
+        test = sample[sample["REP_DT"] >= test_start]
+        if train.empty or valid.empty or test.empty:
+            print(f"{horizon} пропущен — мало данных (train={len(train)}, valid={len(valid)}, test={len(test)}).")
+            continue
 
-    for days in windows:
-        minimum = max(1, int(np.ceil(days * min_coverage)))
-        rolling = past.rolling(days, min_periods=minimum)
-        changes = past_change.rolling(days, min_periods=minimum)
-        mean, std = rolling.mean(), rolling.std()
-        low, high = rolling.min(), rolling.max()
-        q25, q75 = rolling.quantile(0.25), rolling.quantile(0.75)
-        count = past.notna().rolling(days, min_periods=1).sum()
-
-        stats = {
-            "count": count,
-            "coverage": count / days,
-            "mean": mean,
-            "median": rolling.median(),
-            "std": std,
-            "min": low,
-            "max": high,
-            "range": high - low,
-            "q10": rolling.quantile(0.10),
-            "q25": q25,
-            "q75": q75,
-            "q90": rolling.quantile(0.90),
-            "iqr": q75 - q25,
-            "skew": rolling.skew(),
-            "slope": rolling.apply(slope_per_day, raw=True),
-            "lag1_minus_mean": past - mean,
-            "lag1_zscore": safe_ratio(past - mean, std),
-            "change_mean": changes.mean(),
-            "change_std": changes.std(),
-            "change_abs_mean": past_change.abs().rolling(days, min_periods=minimum).mean(),
-            "change_up_share": (
-                past_change.gt(0).where(past_change.notna())
-                .rolling(days, min_periods=minimum).mean()
-            ),
-        }
-        features.update({f"stat_roll_{days}d_{name}": values for name, values in stats.items()})
-
-    for span in (7, 28, 90):
-        ew = past.ewm(span=span, adjust=False, min_periods=2, ignore_na=False)
-        features[f"stat_ewm_{span}d_mean"] = ew.mean()
-        features[f"stat_ewm_{span}d_std"] = ew.std()
-
-    for weeks in (4, 8):
-        same_weekday = pd.concat(
-            [balance.shift(7 * week) for week in range(1, weeks + 1)], axis=1
+        model = CatBoostRegressor(
+            iterations=500, loss_function="MAE", random_seed=42,
+            verbose=False, allow_writing_files=False,
         )
-        count = same_weekday.count(axis=1)
-        enough = count.ge(max(1, int(np.ceil(weeks * min_coverage))))
-        prefix = f"stat_same_weekday_{weeks}w"
-        features[f"{prefix}_count"] = count
-        features[f"{prefix}_mean"] = same_weekday.mean(axis=1).where(enough)
-        features[f"{prefix}_median"] = same_weekday.median(axis=1).where(enough)
-        features[f"{prefix}_std"] = same_weekday.std(axis=1).where(enough)
+        model.fit(
+            train[feature_cols], train["target"], cat_features=cat_cols,
+            eval_set=(valid[feature_cols], valid["target"]), early_stopping_rounds=50,
+        )
+        models[horizon] = model
 
-    stat = pd.DataFrame(features, index=calendar).replace([np.inf, -np.inf], np.nan)
-    # Возвращаем исходные отчётные даты. Пропуски внутри истории сохраняются.
-    return base.join(stat.reindex(base.index)).reset_index()
+        for split, rows in [("train", train), ("valid", valid), ("test", test)]:
+            errors = rows[[*series_cols, "target"]].copy()
+            errors["abs_error"] = (errors["target"] - model.predict(rows[feature_cols])).abs()
+            errors["ape"] = 100 * errors["abs_error"] / errors["target"].abs().replace(0, np.nan)
+            scores = errors.assign(horizon=horizon, split=split).groupby(
+                ["horizon", "split", *series_cols], as_index=False
+            ).agg(MAE=("abs_error", "mean"), MAPE_pct=("ape", "mean"), n=("target", "size"))
+            metrics.append(scores)
 
-
-df_stat = make_stat_features(df_fl)
-df_stat.tail()
+    if not metrics:
+        raise ValueError("Для заданных горизонтов не получилось собрать train, valid и test.")
+    return models, pd.concat(metrics, ignore_index=True)

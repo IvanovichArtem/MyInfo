@@ -1,61 +1,44 @@
-# Если пакет ещё не установлен: %pip install holidays
-
-import holidays
-import numpy as np
+import matplotlib.pyplot as plt
 import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
+data = df[[DATE_COL, TARGET_COL]].copy()
+data[DATE_COL] = pd.to_datetime(data[DATE_COL]).dt.normalize()
+y = data.set_index(DATE_COL)[TARGET_COL].sort_index().asfreq("D")
 
-def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Возвращает датафрейм с календарными признаками по REP_DT."""
-    dates = pd.to_datetime(df["REP_DT"]).dt.tz_localize(None).dt.normalize()
-    cal = dates.dt
-    iso = cal.isocalendar()
-    weekday = cal.dayofweek.astype("Int8")  # Понедельник = 0
+horizon = 30
+train_end = int(len(y) * 0.70)
+valid_end = int(len(y) * 0.85)
+train = y.iloc[:train_end]
 
-    years = cal.year.dropna().astype(int)
-    # Соседние годы нужны для поиска ближайшего праздника на границе года.
-    holiday_years = range(years.min() - 1, years.max() + 2) if not years.empty else []
-    calendar = holidays.country_holidays("RU", years=holiday_years, observed=True)
+result = SARIMAX(train, order=(1, 1, 1), seasonal_order=(1, 0, 1, 7)).fit(disp=False)
 
-    holiday_names = {pd.Timestamp(day): name for day, name in calendar.items()}
-    holiday_name = dates.map(holiday_names).astype("string")
-    holiday_dates = pd.DatetimeIndex(sorted(holiday_names))
-    holiday_lookup = pd.Series(holiday_dates, index=holiday_dates)
+pred = pd.Series(index=y.index, dtype=float, name="Прогноз")
+for i in range(train_end - 1, len(y) - horizon):
+    if i >= train_end:
+        result = result.extend(y.iloc[i:i + 1])
+    pred.iloc[i + horizon] = result.forecast(steps=horizon).iloc[-1]
 
-    previous_holiday = holiday_lookup.reindex(dates, method="ffill").to_numpy()
-    next_holiday = holiday_lookup.reindex(dates, method="bfill").to_numpy()
-    # В сам праздник оба расстояния равны нулю.
-    days_since_holiday = (dates - previous_holiday).dt.days.astype("Int64")
-    days_until_holiday = (next_holiday - dates).dt.days.astype("Int64")
+scores = pd.DataFrame({"Факт": y, "Прогноз": pred})
+valid = scores.iloc[train_end:valid_end]
+test = scores.iloc[valid_end:]
 
-    return df.assign(
-        year=cal.year,
-        quarter=cal.quarter,
-        month=cal.month,
-        day_of_month=cal.day,
-        day_of_year=cal.dayofyear,
-        iso_year=iso.year,
-        iso_week=iso.week,
-        day_of_week=weekday,
-        is_weekend=weekday.ge(5),
-        is_month_start=cal.is_month_start,
-        is_month_end=cal.is_month_end,
-        is_quarter_start=cal.is_quarter_start,
-        is_quarter_end=cal.is_quarter_end,
-        is_year_start=cal.is_year_start,
-        is_year_end=cal.is_year_end,
-        days_to_month_end=cal.days_in_month - cal.day,
-        weekday_sin=np.sin(2 * np.pi * weekday / 7),
-        weekday_cos=np.cos(2 * np.pi * weekday / 7),
-        month_sin=np.sin(2 * np.pi * (cal.month - 1) / 12),
-        month_cos=np.cos(2 * np.pi * (cal.month - 1) / 12),
-        is_holiday=holiday_name.notna().astype("boolean").where(dates.notna()),
-        holiday_name=holiday_name,
-        days_since_holiday=days_since_holiday,
-        days_until_holiday=days_until_holiday,
-        is_day_before_holiday=days_until_holiday.eq(1),
-        is_day_after_holiday=days_since_holiday.eq(1),
+for name, part in [("valid", valid), ("test", test)]:
+    part = part.dropna()
+    if part.empty:
+        print(f"{name} — нет дат с фактом и прогнозом")
+        continue
+
+    mae = mean_absolute_error(part["Факт"], part["Прогноз"])
+    nonzero = part[part["Факт"] != 0]
+    mape = (
+        f"{mean_absolute_percentage_error(nonzero['Факт'], nonzero['Прогноз']):.2%}"
+        if len(nonzero) else "н/д"
     )
+    print(f"{name} — MAE {mae:.3f}, MAPE {mape}")
 
-
-df = add_calendar_features(df)
+ax = test.plot(figsize=(12, 4), style=["-", "--"], grid=True)
+ax.set(title="SARIMA на тесте — горизонт 30 дней", xlabel="Дата прогноза", ylabel=TARGET_COL)
+plt.tight_layout()
+plt.show()

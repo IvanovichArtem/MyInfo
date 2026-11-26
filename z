@@ -1,44 +1,16 @@
-import matplotlib.pyplot as plt
-import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+train_plot = pd.DataFrame({
+    "Факт": train,
+    "Подгонка на 1 день": train_fitted,
+})
 
-data = df[[DATE_COL, TARGET_COL]].copy()
-data[DATE_COL] = pd.to_datetime(data[DATE_COL]).dt.normalize()
-y = data.set_index(DATE_COL)[TARGET_COL].sort_index().asfreq("D")
+for part, title in [
+    (train_plot, "Train — факт и подгонка"),
+    (valid, "Valid — прогноз на 30 дней"),
+    (test, "Test — прогноз на 30 дней"),
+]:
+    fig, ax = plt.subplots(figsize=(12, 4))
+    part.plot(ax=ax, style=["-", "--"], grid=True)
+    ax.set(title=title, xlabel="Дата значения", ylabel=TARGET_COL)
+    fig.tight_layout()
 
-horizon = 30
-train_end = int(len(y) * 0.70)
-valid_end = int(len(y) * 0.85)
-train = y.iloc[:train_end]
-
-result = SARIMAX(train, order=(1, 1, 1), seasonal_order=(1, 0, 1, 7)).fit(disp=False)
-
-pred = pd.Series(index=y.index, dtype=float, name="Прогноз")
-for i in range(train_end - 1, len(y) - horizon):
-    if i >= train_end:
-        result = result.extend(y.iloc[i:i + 1])
-    pred.iloc[i + horizon] = result.forecast(steps=horizon).iloc[-1]
-
-scores = pd.DataFrame({"Факт": y, "Прогноз": pred})
-valid = scores.iloc[train_end:valid_end]
-test = scores.iloc[valid_end:]
-
-for name, part in [("valid", valid), ("test", test)]:
-    part = part.dropna()
-    if part.empty:
-        print(f"{name} — нет дат с фактом и прогнозом")
-        continue
-
-    mae = mean_absolute_error(part["Факт"], part["Прогноз"])
-    nonzero = part[part["Факт"] != 0]
-    mape = (
-        f"{mean_absolute_percentage_error(nonzero['Факт'], nonzero['Прогноз']):.2%}"
-        if len(nonzero) else "н/д"
-    )
-    print(f"{name} — MAE {mae:.3f}, MAPE {mape}")
-
-ax = test.plot(figsize=(12, 4), style=["-", "--"], grid=True)
-ax.set(title="SARIMA на тесте — горизонт 30 дней", xlabel="Дата прогноза", ylabel=TARGET_COL)
-plt.tight_layout()
 plt.show()

@@ -1,16 +1,25 @@
-train_plot = pd.DataFrame({
-    "Факт": train,
-    "Подгонка на 1 день": train_fitted,
-})
+calendar = df[[DATE_COL, "is_year_and"]].copy()
+calendar[DATE_COL] = pd.to_datetime(calendar[DATE_COL]).dt.normalize()
+exog = calendar.set_index(DATE_COL)[["is_year_and"]].reindex(y.index).astype(float)
 
-for part, title in [
-    (train_plot, "Train — факт и подгонка"),
-    (valid, "Valid — прогноз на 30 дней"),
-    (test, "Test — прогноз на 30 дней"),
-]:
-    fig, ax = plt.subplots(figsize=(12, 4))
-    part.plot(ax=ax, style=["-", "--"], grid=True)
-    ax.set(title=title, xlabel="Дата значения", ylabel=TARGET_COL)
-    fig.tight_layout()
+# Раскомментируй, если нужен отдельный эффект всего декабря.
+# exog["is_december"] = (y.index.month == 12).astype(float)
 
-plt.show()
+if exog.isna().any().any():
+    raise ValueError("Заполни is_year_and по календарю для всех дат ряда.")
+
+result = SARIMAX(
+    train,
+    exog=exog.iloc[:train_end],
+    order=(1, 1, 1),
+    seasonal_order=(1, 0, 1, 7),
+).fit(disp=False)
+train_fitted = result.fittedvalues
+
+pred = pd.Series(index=y.index, dtype=float, name="Прогноз")
+for i in range(train_end - 1, len(y) - horizon):
+    if i >= train_end:
+        result = result.extend(y.iloc[i:i + 1], exog=exog.iloc[i:i + 1])
+
+    future_exog = exog.iloc[i + 1:i + horizon + 1]
+    pred.iloc[i + horizon] = result.forecast(steps=horizon, exog=future_exog).iloc[-1]
